@@ -1,0 +1,70 @@
+# 데이터 폴더들
+dataset/
+corrupted_dataset/
+data_download/
+*.csv
+*.json
+*.pkl
+*.pickle
+
+# 외부 저장소 (README 참고)
+model/LGrad/lgrad/
+model/NPR/npr/
+
+# 모델 가중치 파일들
+*.pth
+*.pt
+*.h5
+*.pb
+*.ckpt
+*.weights
+*.model
+model/checkpoints/
+model/saved_models/
+model/weights/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 대용량 파일들
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.avi
+*.mov
+*.zip
+*.tar
+*.gz
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 로그 파일
+*.log
+logs/
+
+# 임시 파일
+*.tmp
+*.temp
