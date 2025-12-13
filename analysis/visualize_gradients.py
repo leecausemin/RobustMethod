@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from torchvision import transforms
 
 # Add project root to path
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from model.LGrad.lgrad_model import LGrad
 from utils.data.dataset import CorruptedDataset
