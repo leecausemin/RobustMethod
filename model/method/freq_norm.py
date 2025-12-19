@@ -91,6 +91,9 @@ class FrequencyNormalizer(nn.Module):
         """
         Apply frequency normalization to gradient.
 
+        Only adjusts High and VeryHigh frequency bands to avoid
+        changing the overall brightness and low-frequency structure.
+
         Args:
             grad: [B, 3, H, W] gradient tensor
 
@@ -103,8 +106,15 @@ class FrequencyNormalizer(nn.Module):
         grad_fft = torch.fft.fft2(grad)  # [B, 3, H, W]
         grad_fft_shifted = torch.fft.fftshift(grad_fft, dim=(-2, -1))
 
-        # Apply band-wise gain
+        # Apply band-wise gain (only to High and VeryHigh frequencies)
+        # Band indices: 0=DC+VeryLow, 1=Low, 2=Mid, 3=High, 4=VeryHigh
+        HIGH_FREQ_BANDS = [3, 4]  # Only adjust High and VeryHigh
+
         for band_idx, mask in enumerate(self.band_masks):
+            # Skip low and mid frequency bands
+            if band_idx not in HIGH_FREQ_BANDS:
+                continue
+
             # Compute current energy for this band
             power = torch.abs(grad_fft_shifted) ** 2  # [B, 3, H, W]
 
@@ -270,9 +280,9 @@ def create_lgrad_freqnorm(
     stylegan_weights: str,
     classifier_weights: str,
     reference_stats_path: str,
-    rho: float = 0.5,
-    alpha_min: float = 0.5,
-    alpha_max: float = 2.0,
+    rho: float = 0.3,
+    alpha_min: float = 0.85,
+    alpha_max: float = 1.15,
     device: str = "cuda",
 ) -> LGradFreqNorm:
     """
