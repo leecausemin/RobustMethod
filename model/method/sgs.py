@@ -1,16 +1,18 @@
 """
-Stochastic Gradient Smoothing (SGS) for LGrad
+Stochastic Gradient Smoothing (SGS) for LGrad using Anisotropic Huber-TV
 
 핵심 아이디어:
-한 장에서 gradient를 한 번만 뽑지 말고, 작은 랜덤 변형을 K번 주고
-gradient를 K개 뽑아 평균낸 다음 LGrad에 넣는다.
+한 장에서 gradient를 한 번만 뽑지 말고, Anisotropic Huber-TV denoising을
+K번 적용해서 gradient를 K개 뽑아 평균낸 다음 LGrad에 넣는다.
 
-→ 노이즈/압축으로 생기는 고분산 성분을 평균으로 눌러서
+→ Huber-TV의 edge-preserving denoising을 통해 Gaussian noise를 제거하면서
+   노이즈/압축으로 생기는 고분산 성분을 평균으로 눌러서
    "진짜 남아있는 artifact 성분"을 살린다.
 
 노벨티:
-"LGrad의 핵심 표현이 gradient이므로, 입력-공간이 아니라
- gradient-공간에서의 test-time smoothing을 한다"
+1. LGrad의 핵심 표현이 gradient이므로, 입력-공간이 아니라
+   gradient-공간에서의 test-time smoothing을 한다
+2. Anisotropic Huber-TV를 사용하여 edge는 보존하면서 smooth region의 노이즈만 제거
 """
 
 import copy
@@ -25,150 +27,216 @@ from torchvision import transforms
 
 @dataclass
 class SGSConfig:
-    """Configuration for Stochastic Gradient Smoothing"""
+    """Configuration for Stochastic Gradient Smoothing with Huber-TV
+
+    Note: lambda_tv의 적절한 값은 gradient 스케일에 의존합니다.
+    현재 기본값은 LGrad의 gradient map 스케일 기준입니다.
+
+    K개의 view를 생성할 때, 각기 다른 하이퍼파라미터를 사용하여
+    다양한 노이즈 타입(gaussian, jpeg, blur 등)에 robust하게 대응합니다.
+    """
     K: int = 5  # Number of views to sample
-    augmentation_types: list = None  # ["blur", "denoise", "jpeg", "deblock"]
-    blur_sigma_range: tuple = (0.1, 0.5)  # Gaussian blur sigma range
-    jpeg_quality_range: tuple = (75, 95)  # JPEG quality range
-    denoise_strength: float = 0.02  # Denoising strength
+
+    # 기본 하이퍼파라미터 (K개의 파라미터 세트를 자동 생성할 때 사용)
+    huber_tv_lambda: float = 0.05  # TV regularization strength
+    huber_tv_delta: float = 0.01  # Huber threshold (L1/L2 transition point)
+    huber_tv_iterations: int = 3  # Number of gradient descent iterations
+    huber_tv_step_size: float = 0.2  # Gradient descent step size
+
+    # 파라미터 생성 전략
+    lambda_range: tuple[float, float] = (0.5, 1.5)  # base 대비 범위 (좁은 범위)
+    jitter_strength: float = 0.1  # 랜덤 jitter 강도 (0.1 = ±10%)
+    couple_delta_to_lambda: bool = True  # δ를 λ와 함께 움직일지
+
+    # K개의 다양한 파라미터 세트 (None이면 자동 생성)
+    # 각 원소는 (lambda_tv, delta, iterations, step_size) 튜플
+    param_sets: Optional[list[tuple[float, float, int, float]]] = None
+
     device: str = "cuda"
 
     def __post_init__(self):
-        if self.augmentation_types is None:
-            # Default: mix of blur and JPEG (가장 효과적)
-            self.augmentation_types = ["blur", "jpeg"]
+        """K개의 다양한 파라미터 세트를 자동 생성"""
+        if self.param_sets is None:
+            self.param_sets = self._generate_param_sets()
+
+        # K와 param_sets 길이가 맞는지 확인
+        if len(self.param_sets) != self.K:
+            raise ValueError(f"param_sets length ({len(self.param_sets)}) must match K ({self.K})")
+
+    def _generate_param_sets(self) -> list[tuple[float, float, int, float]]:
+        """
+        K개의 다양한 하이퍼파라미터 세트를 자동 생성.
+
+        전략: D(좁은 범위) + 약한 C(jitter)
+        - 기본값 주변 좁은 범위(±50%)에서 균등 간격
+        - δ를 λ와 함께 움직임: δ ∝ √(λ/base_λ)
+        - 각 값에 작은 랜덤 jitter (±10%) 추가
+
+        이유:
+        - 너무 넓은 범위: 일부 view가 구조를 과하게 깎아 평균 망가짐
+        - 너무 좁은 범위: view들이 비슷해서 평균의 이점 감소
+        - δ를 함께 움직임: λ만 키우면 구조 손상, δ도 키우면 부드럽게 조절
+
+        Returns:
+            K개의 (lambda_tv, delta, iterations, step_size) 튜플 리스트
+        """
+        import numpy as np
+
+        param_sets = []
+        base_lambda = self.huber_tv_lambda
+        base_delta = self.huber_tv_delta
+
+        # View 0: Original (no denoising)
+        param_sets.append((0.0, 0.0, 0, 0.0))
+
+        # View 1~K-1: 좁은 범위에서 균등 간격 + jitter
+        if self.K > 1:
+            # λ 범위: [0.5*base, 1.5*base] 에서 균등 간격
+            lambda_min = base_lambda * self.lambda_range[0]
+            lambda_max = base_lambda * self.lambda_range[1]
+
+            for i in range(self.K - 1):
+                # 균등 간격
+                lambda_base = lambda_min + (lambda_max - lambda_min) * i / max(1, self.K - 2)
+
+                # 작은 jitter 추가 (±10%)
+                jitter = np.random.uniform(-self.jitter_strength, self.jitter_strength)
+                lambda_i = lambda_base * (1 + jitter)
+                lambda_i = max(0.0, lambda_i)  # 음수 방지
+
+                # δ를 λ와 함께 움직임
+                if self.couple_delta_to_lambda:
+                    # δ ∝ √(λ/base_λ) (부드럽게 조절)
+                    delta_ratio = np.sqrt(lambda_i / (base_lambda + 1e-8))
+                    delta_i = base_delta * delta_ratio
+                else:
+                    # δ는 고정 (옛날 방식)
+                    delta_i = base_delta
+
+                # Iterations와 step_size는 고정
+                param_sets.append((
+                    lambda_i,
+                    delta_i,
+                    self.huber_tv_iterations,
+                    self.huber_tv_step_size
+                ))
+
+        return param_sets
 
 
 class StochasticAugmenter:
     """
-    Test-time stochastic augmentation for gradient smoothing.
+    Test-time Anisotropic Huber-TV augmentation for gradient smoothing.
 
-    매우 약한 변형만 적용 (gradient의 공통 성분을 보존하면서 노이즈만 제거)
+    Huber-TV를 사용한 edge-preserving denoising으로 gradient의 공통 성분을 보존하면서 노이즈만 제거
     """
 
     def __init__(self, config: SGSConfig):
         self.cfg = config
 
-    def apply_weak_blur(self, x: torch.Tensor) -> torch.Tensor:
+    def apply_anisotropic_huber_tv(
+        self,
+        x: torch.Tensor,
+        lambda_tv: float = None,
+        huber_delta: float = None,
+        iterations: int = None,
+        step_size: float = None
+    ) -> torch.Tensor:
         """
-        Apply very weak Gaussian blur.
+        Apply Anisotropic Huber Total Variation denoising.
 
-        목적: 고주파 노이즈를 살짝 감소시켜 gradient의 분산 줄이기
+        목적: Edge-preserving denoising (Gaussian noise 제거에 특히 효과적)
+
+        Anisotropic TV:
+        - 수평/수직 방향을 독립적으로 처리
+        - Edge는 보존하면서 smooth region의 노이즈만 제거
+
+        Huber norm:
+        - L1 (robust to outliers) + L2 (smooth) 혼합
+        - δ 작음: outlier/블록/스파이크에 robust, edge 보존↑
+        - δ 큼: 전반적으로 더 매끈하지만 edge도 같이 깎일 수 있음
+
+        Args:
+            x: Input image [B, C, H, W]
+            lambda_tv: TV regularization strength (작을수록 약한 denoising)
+            huber_delta: Huber threshold (작을수록 L1 성향↑, outlier에 robust)
+            iterations: Number of gradient descent steps
+            step_size: Gradient descent step size
+
+        Returns:
+            Denoised image [B, C, H, W]
         """
-        B, C, H, W = x.shape
+        # Use config values if not specified
+        if lambda_tv is None:
+            lambda_tv = self.cfg.huber_tv_lambda
+        if huber_delta is None:
+            huber_delta = self.cfg.huber_tv_delta
+        if iterations is None:
+            iterations = self.cfg.huber_tv_iterations
+        if step_size is None:
+            step_size = self.cfg.huber_tv_step_size
 
-        # Random sigma for each sample in batch
-        sigma = torch.rand(B) * (self.cfg.blur_sigma_range[1] - self.cfg.blur_sigma_range[0])
-        sigma = sigma + self.cfg.blur_sigma_range[0]
+        x_denoise = x.clone()
 
-        # Apply blur (simple average over small kernel)
-        kernel_size = 3
-        padding = kernel_size // 2
+        for _ in range(iterations):
+            # Compute spatial gradients (finite differences)
+            # Horizontal gradient
+            dx = torch.zeros_like(x_denoise)
+            dx[:, :, :, :-1] = x_denoise[:, :, :, 1:] - x_denoise[:, :, :, :-1]
 
-        # Simplified: use average pooling as approximation
-        # (더 정확한 Gaussian kernel도 가능하지만 속도 고려)
-        x_blur = F.avg_pool2d(x, kernel_size=kernel_size, stride=1, padding=padding)
+            # Vertical gradient
+            dy = torch.zeros_like(x_denoise)
+            dy[:, :, :-1, :] = x_denoise[:, :, 1:, :] - x_denoise[:, :, :-1, :]
 
-        # Mix original and blurred (매우 약하게)
-        alpha = 0.3  # 30%만 blur
-        x_out = alpha * x_blur + (1 - alpha) * x
+            # Huber function derivative (soft thresholding)
+            # d/dt huber(t) = t / delta      if |t| <= delta
+            #               = sign(t)        if |t| > delta
+            def huber_grad(t, delta):
+                # Smooth approximation
+                return t / (delta + torch.abs(t))
 
-        return x_out
+            # Compute Huber TV gradient
+            gx = huber_grad(dx, huber_delta)
+            gy = huber_grad(dy, huber_delta)
 
-    def apply_jpeg_recompression(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Simulate JPEG recompression with random quality.
+            # Divergence (negative gradient of TV)
+            div_x = torch.zeros_like(x_denoise)
+            div_x[:, :, :, 1:] = gx[:, :, :, 1:] - gx[:, :, :, :-1]
+            div_x[:, :, :, 0] = gx[:, :, :, 0]
 
-        목적: JPEG artifact의 랜덤성을 평균으로 상쇄
+            div_y = torch.zeros_like(x_denoise)
+            div_y[:, :, 1:, :] = gy[:, :, 1:, :] - gy[:, :, :-1, :]
+            div_y[:, :, 0, :] = gy[:, :, 0, :]
 
-        Note: 실제 JPEG 압축은 PIL/OpenCV 필요, 여기서는 간단한 근사 사용
-        """
-        # JPEG 근사: DCT-based quantization simulation
-        # 실전에서는 실제 JPEG encode/decode 사용 권장
+            # Gradient descent step
+            # x_{k+1} = x_k - step_size * [x_k - x_0 - lambda * div(grad_TV)]
+            x_denoise = x_denoise - step_size * (
+                (x_denoise - x) - lambda_tv * (div_x + div_y)
+            )
 
-        # Simplified approach: add slight quantization noise
-        quality = torch.randint(
-            self.cfg.jpeg_quality_range[0],
-            self.cfg.jpeg_quality_range[1] + 1,
-            (1,)
-        ).item()
+            # Clamp to valid range
+            x_denoise = torch.clamp(x_denoise, 0, 1)
 
-        # Quality를 quantization step으로 변환
-        q_step = (100 - quality) / 100.0 * 0.05  # 0~0.05 range
-
-        # Quantization noise
-        noise = torch.randn_like(x) * q_step
-        x_jpeg = torch.clamp(x + noise, 0, 1)
-
-        return x_jpeg
-
-    def apply_denoise(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Apply very weak denoising (bilateral filter approximation).
-
-        목적: Gaussian noise의 영향을 줄이면서 edge 보존
-        """
-        # Simple denoising: weighted average with original
-        x_smooth = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
-
-        # Mix
-        alpha = self.cfg.denoise_strength
-        x_out = (1 - alpha) * x + alpha * x_smooth
-
-        return x_out
-
-    def apply_deblock(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Apply deblocking filter (smooth block boundaries).
-
-        목적: JPEG block artifact 경계를 부드럽게
-        """
-        # Simplified: slight smoothing at 8x8 block boundaries
-        # (실제 deblocking은 더 복잡하지만 근사로 충분)
-
-        kernel_size = 5
-        padding = kernel_size // 2
-        x_smooth = F.avg_pool2d(x, kernel_size=kernel_size, stride=1, padding=padding)
-
-        # Very weak mixing
-        alpha = 0.2
-        x_out = alpha * x_smooth + (1 - alpha) * x
-
-        return x_out
+        return x_denoise
 
     def augment(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Apply random augmentation from configured types.
+        Apply Anisotropic Huber-TV denoising.
 
         Args:
             x: [B, 3, H, W] images in [0, 1]
 
         Returns:
-            x_aug: [B, 3, H, W] augmented images
+            x_aug: [B, 3, H, W] denoised images
         """
-        # Random choice of augmentation
-        aug_type = self.cfg.augmentation_types[
-            torch.randint(0, len(self.cfg.augmentation_types), (1,)).item()
-        ]
-
-        if aug_type == "blur":
-            return self.apply_weak_blur(x)
-        elif aug_type == "jpeg":
-            return self.apply_jpeg_recompression(x)
-        elif aug_type == "denoise":
-            return self.apply_denoise(x)
-        elif aug_type == "deblock":
-            return self.apply_deblock(x)
-        else:
-            # No augmentation (identity)
-            return x
+        return self.apply_anisotropic_huber_tv(x)
 
 
 class LGradSGS(nn.Module):
     """
-    LGrad with Stochastic Gradient Smoothing (SGS)
+    LGrad with Stochastic Gradient Smoothing (SGS) using Anisotropic Huber-TV
 
-    테스트 시 K개의 stochastic view에서 gradient를 추출하고 평균내어
+    테스트 시 K개의 Huber-TV denoised view에서 gradient를 추출하고 평균내어
     고분산 노이즈를 제거하고 진짜 artifact 성분만 보존한다.
 
     Args:
@@ -186,8 +254,15 @@ class LGradSGS(nn.Module):
         ...     device="cuda"
         ... )
         >>>
-        >>> # Apply SGS
-        >>> config = SGSConfig(K=5, augmentation_types=["blur", "jpeg"], device="cuda")
+        >>> # Apply SGS with Huber-TV
+        >>> config = SGSConfig(
+        ...     K=5,
+        ...     huber_tv_lambda=0.05,
+        ...     huber_tv_delta=0.01,
+        ...     huber_tv_iterations=3,
+        ...     huber_tv_step_size=0.2,
+        ...     device="cuda"
+        ... )
         >>> model = LGradSGS(base_lgrad, config)
         >>>
         >>> # Use as normal
@@ -207,13 +282,22 @@ class LGradSGS(nn.Module):
         # Augmenter
         self.augmenter = StochasticAugmenter(config)
 
-        print(f"[SGS] Initialized with K={config.K}, augmentations={config.augmentation_types}")
+        print(f"[SGS] Initialized with K={config.K}")
+        print(f"[SGS] Base params: λ={config.huber_tv_lambda}, δ={config.huber_tv_delta}, iter={config.huber_tv_iterations}, step={config.huber_tv_step_size}")
+        print(f"[SGS] Parameter sets for {config.K} views:")
+        for k, (lam, delta, iters, step) in enumerate(config.param_sets):
+            print(f"  View {k}: λ={lam:.4f}, δ={delta:.4f}, iter={iters}, step={step:.2f}")
 
     def extract_smoothed_gradient(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Extract K gradients from stochastic views and average them.
+        Extract gradient and apply K different Huber-TV denoising, then average.
 
-        This is the core of SGS: gradient-space ensemble.
+        This is the core of SGS: gradient-space ensemble with edge-preserving denoising.
+
+        핵심: 입력 이미지가 아니라 **gradient 공간**에서 smoothing!
+        1. 입력 이미지 → gradient 추출 (한 번만)
+        2. Gradient에 K개의 다른 Huber-TV 파라미터 적용
+        3. K개의 denoised gradient를 평균
 
         Args:
             x: Input images [B, 3, H, W], range [0, 1]
@@ -224,24 +308,33 @@ class LGradSGS(nn.Module):
         B = x.shape[0]
         K = self.cfg.K
 
-        # Storage for K gradients per sample
+        # Step 1: Extract gradient from original image (only once!)
+        grad = self.model.img2grad(x)  # [B, 3, 256, 256]
+
+        # Step 2: Apply K different Huber-TV denoising to the gradient
         all_grads = []
 
         for k in range(K):
-            # Apply stochastic augmentation to create view_k
-            if k == 0:
-                # First view: original (no augmentation)
-                x_k = x
-            else:
-                # Other views: apply random augmentation
-                x_k = self.augmenter.augment(x)
+            # Get parameters for this view
+            lambda_tv, delta, iterations, step_size = self.cfg.param_sets[k]
 
-            # Extract gradient from this view
-            grad_k = self.model.img2grad(x_k)  # [B, 3, 256, 256]
+            # Apply Huber-TV denoising to gradient
+            if k == 0:
+                # First view: original gradient (no denoising)
+                grad_k = grad
+            else:
+                # Apply Huber-TV denoising to gradient with view-specific parameters
+                grad_k = self.augmenter.apply_anisotropic_huber_tv(
+                    grad,
+                    lambda_tv=lambda_tv,
+                    huber_delta=delta,
+                    iterations=iterations,
+                    step_size=step_size
+                )
 
             all_grads.append(grad_k)
 
-        # Stack and average: [K, B, 3, 256, 256] -> [B, 3, 256, 256]
+        # Step 3: Average K denoised gradients
         all_grads = torch.stack(all_grads, dim=0)  # [K, B, 3, 256, 256]
         grad_smoothed = all_grads.mean(dim=0)  # [B, 3, 256, 256]
 
@@ -310,21 +403,26 @@ def create_lgrad_sgs(
     stylegan_weights: str,
     classifier_weights: str,
     K: int = 5,
-    augmentation_types: list = None,
-    blur_sigma_range: tuple = (0.1, 0.5),
-    jpeg_quality_range: tuple = (75, 95),
+    huber_tv_lambda: float = 0.05,
+    huber_tv_delta: float = 0.01,
+    huber_tv_iterations: int = 3,
+    huber_tv_step_size: float = 0.2,
     device: str = "cuda",
 ) -> LGradSGS:
     """
-    Convenience function to create LGrad model with SGS.
+    Convenience function to create LGrad model with SGS using Huber-TV.
+
+    Note: 파라미터 값들은 gradient 스케일에 의존합니다.
+    현재 기본값은 LGrad의 gradient map 기준입니다.
 
     Args:
         stylegan_weights: Path to StyleGAN discriminator weights
         classifier_weights: Path to ResNet50 classifier weights
         K: Number of stochastic views to ensemble
-        augmentation_types: List of augmentations (["blur", "jpeg", "denoise", "deblock"])
-        blur_sigma_range: Range of blur sigma
-        jpeg_quality_range: Range of JPEG quality for recompression
+        huber_tv_lambda: TV regularization strength
+        huber_tv_delta: Huber threshold (작을수록 L1 성향↑, outlier에 robust)
+        huber_tv_iterations: Number of gradient descent iterations
+        huber_tv_step_size: Gradient descent step size
         device: Device to use
 
     Returns:
@@ -335,7 +433,10 @@ def create_lgrad_sgs(
         ...     stylegan_weights="weights/stylegan.pth",
         ...     classifier_weights="weights/classifier.pth",
         ...     K=5,
-        ...     augmentation_types=["blur", "jpeg"]
+        ...     huber_tv_lambda=0.05,
+        ...     huber_tv_delta=0.01,
+        ...     huber_tv_iterations=3,
+        ...     huber_tv_step_size=0.2
         ... )
         >>> probs = model.predict_proba(corrupted_images)
     """
@@ -349,15 +450,13 @@ def create_lgrad_sgs(
         resize=256,
     )
 
-    # Apply SGS
-    if augmentation_types is None:
-        augmentation_types = ["blur", "jpeg"]
-
+    # Apply SGS with Huber-TV
     config = SGSConfig(
         K=K,
-        augmentation_types=augmentation_types,
-        blur_sigma_range=blur_sigma_range,
-        jpeg_quality_range=jpeg_quality_range,
+        huber_tv_lambda=huber_tv_lambda,
+        huber_tv_delta=huber_tv_delta,
+        huber_tv_iterations=huber_tv_iterations,
+        huber_tv_step_size=huber_tv_step_size,
         device=device,
     )
 

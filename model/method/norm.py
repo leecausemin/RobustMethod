@@ -135,6 +135,32 @@ class LGradNORM(nn.Module):
 
                     print(f"[NORM] Adapted {target_name}.{name}")
 
+    def img2grad(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Image to Gradient (delegates to wrapped model).
+
+        Args:
+            x: Input images [B, 3, H, W], range [0, 1]
+
+        Returns:
+            Gradient images [B, 3, 256, 256], normalized to [0,1]
+        """
+        self.model.eval()
+        return self.model.img2grad(x)
+
+    def classify(self, grad: torch.Tensor) -> torch.Tensor:
+        """
+        Classification of Gradient image (delegates to wrapped model).
+
+        Args:
+            grad: Gradient images [B, 3, 256, 256], range [0, 1]
+
+        Returns:
+            Logits [B, 1] (positive = fake)
+        """
+        self.model.eval()
+        return self.model.classify(grad)
+
     def forward(
         self,
         x: torch.Tensor,
