@@ -37,6 +37,11 @@ class SGSConfig:
     """
     K: int = 5  # Number of views to sample
 
+    # Huber-TV 적용 대상
+    denoise_target: Literal["input", "gradient"] = "gradient"
+    # "input": 원본 이미지에 Huber-TV 적용 후 gradient 추출
+    # "gradient": gradient 추출 후 Huber-TV 적용 (기본값)
+
     # 기본 하이퍼파라미터 (K개의 파라미터 세트를 자동 생성할 때 사용)
     huber_tv_lambda: float = 0.05  # TV regularization strength
     huber_tv_delta: float = 0.01  # Huber threshold (L1/L2 transition point)
@@ -282,7 +287,7 @@ class LGradSGS(nn.Module):
         # Augmenter
         self.augmenter = StochasticAugmenter(config)
 
-        print(f"[SGS] Initialized with K={config.K}")
+        print(f"[SGS] Initialized with K={config.K}, denoise_target={config.denoise_target}")
         print(f"[SGS] Base params: λ={config.huber_tv_lambda}, δ={config.huber_tv_delta}, iter={config.huber_tv_iterations}, step={config.huber_tv_step_size}")
         print(f"[SGS] Parameter sets for {config.K} views:")
         for k, (lam, delta, iters, step) in enumerate(config.param_sets):
@@ -294,10 +299,15 @@ class LGradSGS(nn.Module):
 
         This is the core of SGS: gradient-space ensemble with edge-preserving denoising.
 
-        핵심: 입력 이미지가 아니라 **gradient 공간**에서 smoothing!
-        1. 입력 이미지 → gradient 추출 (한 번만)
-        2. Gradient에 K개의 다른 Huber-TV 파라미터 적용
-        3. K개의 denoised gradient를 평균
+        동작 방식 (denoise_target에 따라):
+        - "gradient" (기본값):
+            1. 입력 이미지 → gradient 추출 (한 번만)
+            2. Gradient에 K개의 다른 Huber-TV 파라미터 적용
+            3. K개의 denoised gradient를 평균
+        - "input":
+            1. 입력 이미지에 K개의 다른 Huber-TV 파라미터 적용
+            2. 각 denoised 이미지 → gradient 추출
+            3. K개의 gradient를 평균
 
         Args:
             x: Input images [B, 3, H, W], range [0, 1]
@@ -308,33 +318,59 @@ class LGradSGS(nn.Module):
         B = x.shape[0]
         K = self.cfg.K
 
-        # Step 1: Extract gradient from original image (only once!)
-        grad = self.model.img2grad(x)  # [B, 3, 256, 256]
-
-        # Step 2: Apply K different Huber-TV denoising to the gradient
         all_grads = []
 
-        for k in range(K):
-            # Get parameters for this view
-            lambda_tv, delta, iterations, step_size = self.cfg.param_sets[k]
+        if self.cfg.denoise_target == "gradient":
+            # Step 1: Extract gradient from original image (only once!)
+            grad = self.model.img2grad(x)  # [B, 3, 256, 256]
 
-            # Apply Huber-TV denoising to gradient
-            if k == 0:
-                # First view: original gradient (no denoising)
-                grad_k = grad
-            else:
-                # Apply Huber-TV denoising to gradient with view-specific parameters
-                grad_k = self.augmenter.apply_anisotropic_huber_tv(
-                    grad,
-                    lambda_tv=lambda_tv,
-                    huber_delta=delta,
-                    iterations=iterations,
-                    step_size=step_size
-                )
+            # Step 2: Apply K different Huber-TV denoising to the gradient
+            for k in range(K):
+                # Get parameters for this view
+                lambda_tv, delta, iterations, step_size = self.cfg.param_sets[k]
 
-            all_grads.append(grad_k)
+                # Apply Huber-TV denoising to gradient
+                if k == 0:
+                    # First view: original gradient (no denoising)
+                    grad_k = grad
+                else:
+                    # Apply Huber-TV denoising to gradient with view-specific parameters
+                    grad_k = self.augmenter.apply_anisotropic_huber_tv(
+                        grad,
+                        lambda_tv=lambda_tv,
+                        huber_delta=delta,
+                        iterations=iterations,
+                        step_size=step_size
+                    )
 
-        # Step 3: Average K denoised gradients
+                all_grads.append(grad_k)
+
+        else:  # denoise_target == "input"
+            # Step 1: Apply K different Huber-TV denoising to input image
+            for k in range(K):
+                # Get parameters for this view
+                lambda_tv, delta, iterations, step_size = self.cfg.param_sets[k]
+
+                # Apply Huber-TV denoising to input
+                if k == 0:
+                    # First view: original input (no denoising)
+                    x_k = x
+                else:
+                    # Apply Huber-TV denoising to input with view-specific parameters
+                    x_k = self.augmenter.apply_anisotropic_huber_tv(
+                        x,
+                        lambda_tv=lambda_tv,
+                        huber_delta=delta,
+                        iterations=iterations,
+                        step_size=step_size
+                    )
+
+                # Step 2: Extract gradient from denoised input
+                grad_k = self.model.img2grad(x_k)
+
+                all_grads.append(grad_k)
+
+        # Step 3: Average K gradients
         all_grads = torch.stack(all_grads, dim=0)  # [K, B, 3, 256, 256]
         grad_smoothed = all_grads.mean(dim=0)  # [B, 3, 256, 256]
 
@@ -403,6 +439,7 @@ def create_lgrad_sgs(
     stylegan_weights: str,
     classifier_weights: str,
     K: int = 5,
+    denoise_target: Literal["input", "gradient"] = "gradient",
     huber_tv_lambda: float = 0.05,
     huber_tv_delta: float = 0.01,
     huber_tv_iterations: int = 3,
@@ -419,6 +456,7 @@ def create_lgrad_sgs(
         stylegan_weights: Path to StyleGAN discriminator weights
         classifier_weights: Path to ResNet50 classifier weights
         K: Number of stochastic views to ensemble
+        denoise_target: Where to apply Huber-TV ("input" or "gradient")
         huber_tv_lambda: TV regularization strength
         huber_tv_delta: Huber threshold (작을수록 L1 성향↑, outlier에 robust)
         huber_tv_iterations: Number of gradient descent iterations
@@ -429,14 +467,22 @@ def create_lgrad_sgs(
         LGradSGS model ready for inference
 
     Example:
+        >>> # Denoise gradient (기본값)
         >>> model = create_lgrad_sgs(
         ...     stylegan_weights="weights/stylegan.pth",
         ...     classifier_weights="weights/classifier.pth",
         ...     K=5,
-        ...     huber_tv_lambda=0.05,
-        ...     huber_tv_delta=0.01,
-        ...     huber_tv_iterations=3,
-        ...     huber_tv_step_size=0.2
+        ...     denoise_target="gradient",
+        ...     huber_tv_lambda=0.05
+        ... )
+        >>>
+        >>> # Denoise input image
+        >>> model = create_lgrad_sgs(
+        ...     stylegan_weights="weights/stylegan.pth",
+        ...     classifier_weights="weights/classifier.pth",
+        ...     K=5,
+        ...     denoise_target="input",
+        ...     huber_tv_lambda=0.05
         ... )
         >>> probs = model.predict_proba(corrupted_images)
     """
@@ -453,6 +499,7 @@ def create_lgrad_sgs(
     # Apply SGS with Huber-TV
     config = SGSConfig(
         K=K,
+        denoise_target=denoise_target,
         huber_tv_lambda=huber_tv_lambda,
         huber_tv_delta=huber_tv_delta,
         huber_tv_iterations=huber_tv_iterations,

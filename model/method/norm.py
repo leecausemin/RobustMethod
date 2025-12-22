@@ -37,7 +37,7 @@ class LGradNORM(nn.Module):
 
     Example:
         >>> from model.LGrad.lgrad_model import LGrad
-        >>> from model.method.method import LGradNORM, NORMConfig
+        >>> from model.method.norm import LGradNORM, NORMConfig
         >>>
         >>> # Load base model
         >>> lgrad = LGrad(
