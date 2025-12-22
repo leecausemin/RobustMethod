@@ -135,8 +135,9 @@ def main():
     base_dir = Path(__file__).parent
     output_dir = base_dir / "corrupted_data"
 
-    severity = input("\nEnter corruption severity (1-5, default=3): ").strip()
-    severity = int(severity) if severity else 3
+    # Automatically set corruption severity to 3
+    severity = 3
+    print(f"\nCorruption severity: {severity} (automatic)")
 
     num_workers_input = input("Enter number of parallel workers (default=auto): ").strip()
     num_workers = int(num_workers_input) if num_workers_input else None

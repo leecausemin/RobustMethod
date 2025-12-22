@@ -16,8 +16,9 @@ LGrad와 NPR 모델을 사용한 강건한 딥페이크 탐지를 위한 Test-Ti
 - [설치](#설치)
 - [시작하기](#시작하기)
   - [1. 저장소 클론](#1-저장소-클론)
-  - [2. 모델 가중치 다운로드](#2-모델-가중치-다운로드)
-  - [3. 데이터셋 다운로드](#3-데이터셋-다운로드)
+  - [2. 모델 Git Clone](#2-모델-git-clone)
+  - [3. 모델 가중치 다운로드](#3-모델-가중치-다운로드)
+  - [4. 데이터셋 다운로드](#4-데이터셋-다운로드)
 - [사용법](#사용법)
 - [프로젝트 구조](#프로젝트-구조)
 - [참고자료](#참고자료)
@@ -48,7 +49,23 @@ git clone https://github.com/leecausemin/RobustMethod.git
 cd RobustMethod
 ```
 
-### 2. 모델 가중치 다운로드
+### 2. 모델 Git Clone
+
+LGrad와 NPR 원본 저장소를 클론해야 합니다:
+
+```bash
+# LGrad 클론
+cd model/LGrad
+git clone https://github.com/chuangchuangtan/LGrad.git lgrad
+cd ../..
+
+# NPR 클론
+cd model/NPR
+git clone https://github.com/chuangchuangtan/NPR-DeepfakeDetection.git npr
+cd ../..
+```
+
+### 3. 모델 가중치 다운로드
 
 #### LGrad 가중치
 
@@ -82,7 +99,7 @@ NPR 가중치는 이미 저장소에 포함되어 있습니다:
 
 가중치가 없다면 [NPR GitHub](https://github.com/chuangchuangtan/NPR-DeepfakeDetection)에서 다운로드하여 `model/NPR/weights/` 에 배치
 
-### 3. 데이터셋 다운로드
+### 4. 데이터셋 다운로드
 
 **CNNDetection 데이터셋 다운로드 및 Corruption 자동 적용**
 
@@ -120,94 +137,6 @@ corrupted_data_<gan_type>/
 ---
 
 ## 사용법
-
-### 기본 예제 - LGrad + NORM
-
-```python
-from model.LGrad.lgrad_model import LGrad
-from model.method.norm import UnifiedNORM, NORMConfig
-
-# LGrad 베이스 모델 로드
-lgrad = LGrad(
-    stylegan_weights="model/LGrad/weights/karras2019stylegan-bedrooms-256x256_discriminator.pth",
-    classifier_weights="model/LGrad/weights/LGrad-Pretrained-Model/LGrad-4class-Trainon-Progan_car_cat_chair_horse.pth",
-    device="cuda"
-)
-
-# NORM 적응 적용
-config = NORMConfig(
-    source_sum=128,
-    model="LGrad",
-    adaptation_target="classifier",
-    device="cuda"
-)
-model = UnifiedNORM(lgrad, config)
-
-# 손상된 이미지에 대한 예측
-import torch
-images = torch.randn(4, 3, 256, 256).cuda()  # 여기에 이미지 입력
-probs = model.predict_proba(images)
-print(f"가짜일 확률: {probs}")
-```
-
-### 기본 예제 - LGrad + SGS
-
-```python
-from model.LGrad.lgrad_model import LGrad
-from model.method.sgs import UnifiedSGS, SGSConfig
-
-# LGrad 베이스 모델 로드
-lgrad = LGrad(
-    stylegan_weights="model/LGrad/weights/karras2019stylegan-bedrooms-256x256_discriminator.pth",
-    classifier_weights="model/LGrad/weights/LGrad-Pretrained-Model/LGrad-4class-Trainon-Progan_car_cat_chair_horse.pth",
-    device="cuda"
-)
-
-# SGS (Stochastic Gradient Smoothing) 적용
-config = SGSConfig(
-    K=5,  # 뷰 개수
-    model="LGrad",
-    denoise_target="artifact",  # gradient 디노이징
-    huber_tv_lambda=0.05,
-    huber_tv_delta=0.01,
-    device="cuda"
-)
-model = UnifiedSGS(lgrad, config)
-
-# 손상된 이미지에 대한 예측
-import torch
-images = torch.randn(4, 3, 256, 256).cuda()
-probs = model.predict_proba(images)
-print(f"가짜일 확률: {probs}")
-```
-
-### 기본 예제 - NPR + NORM
-
-```python
-from model.NPR.npr_model import NPR
-from model.method.norm import UnifiedNORM, NORMConfig
-
-# NPR 베이스 모델 로드
-npr = NPR(
-    weights="model/NPR/weights/NPR.pth",
-    device="cuda"
-)
-
-# NORM 적응 적용
-config = NORMConfig(
-    source_sum=128,
-    model="NPR",
-    adaptation_target="model",
-    device="cuda"
-)
-model = UnifiedNORM(npr, config)
-
-# 예측
-import torch
-images = torch.randn(4, 3, 256, 256).cuda()
-probs = model.predict_proba(images)
-print(f"가짜일 확률: {probs}")
-```
 
 ### 예제 노트북 실행
 
