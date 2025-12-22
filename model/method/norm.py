@@ -20,47 +20,53 @@ import torch.nn as nn
 class NORMConfig:
     """Configuration for NORM adaptation"""
     source_sum: int = 128  # Accumulated source batch size for weighting
-    adaptation_target: str = "classifier"  # "classifier", "grad_model", "both"
+    model: str = "LGrad"  # "LGrad" or "NPR"
+    adaptation_target: str = "classifier"  # "classifier", "grad_model", "both" (LGrad only), "model" (NPR)
     device: str = "cuda"
 
 
-class LGradNORM(nn.Module):
+class UnifiedNORM(nn.Module):
     """
-    LGrad with NORM (Normalization-based Test-Time Adaptation)
+    Unified NORM (Normalization-based Test-Time Adaptation) for both LGrad and NPR
 
-    Adapts BatchNorm layers in the LGrad classifier during test-time to handle
+    Adapts BatchNorm layers in the model during test-time to handle
     distribution shifts caused by image corruptions.
 
     Args:
-        lgrad_model: Pre-trained LGrad model
+        base_model: Pre-trained LGrad or NPR model
         config: NORM configuration
 
     Example:
         >>> from model.LGrad.lgrad_model import LGrad
-        >>> from model.method.norm import LGradNORM, NORMConfig
+        >>> from model.NPR.npr_model import NPR
+        >>> from model.method.norm import UnifiedNORM, NORMConfig
         >>>
-        >>> # Load base model
-        >>> lgrad = LGrad(
-        ...     stylegan_weights="path/to/stylegan.pth",
-        ...     classifier_weights="path/to/classifier.pth"
-        ... )
+        >>> # For LGrad
+        >>> lgrad = LGrad(stylegan_weights="...", classifier_weights="...", device="cuda")
+        >>> config = NORMConfig(source_sum=128, model="LGrad", adaptation_target="classifier")
+        >>> model = UnifiedNORM(lgrad, config)
         >>>
-        >>> # Apply NORM adaptation
-        >>> config = NORMConfig(source_sum=128)
-        >>> model = LGradNORM(lgrad, config)
+        >>> # For NPR
+        >>> npr = NPR(weights="...", device="cuda")
+        >>> config = NORMConfig(source_sum=128, model="NPR", adaptation_target="model")
+        >>> model = UnifiedNORM(npr, config)
         >>>
         >>> # Use as normal
         >>> predictions = model.predict_proba(images)
     """
 
-    def __init__(self, lgrad_model, config: NORMConfig):
+    def __init__(self, base_model, config: NORMConfig):
         super().__init__()
         self.cfg = config
         self.device = config.device
 
         # Deep copy to avoid modifying original model
-        self.model = copy.deepcopy(lgrad_model)
+        self.model = copy.deepcopy(base_model)
         self.model.to(self.device)
+
+        # Validate config
+        if config.model not in ["LGrad", "NPR"]:
+            raise ValueError(f"Unsupported model type: {config.model}")
 
         self._setup()
 
@@ -83,10 +89,18 @@ class LGradNORM(nn.Module):
 
         # Determine which parts to adapt
         targets = []
-        if self.cfg.adaptation_target in ("classifier", "both"):
-            targets.append(("classifier", self.model.classifier))
-        if self.cfg.adaptation_target in ("grad_model", "both"):
-            targets.append(("grad_model", self.model.grad_model))
+
+        if self.cfg.model == "LGrad":
+            if self.cfg.adaptation_target in ("classifier", "both"):
+                targets.append(("classifier", self.model.classifier))
+            if self.cfg.adaptation_target in ("grad_model", "both"):
+                targets.append(("grad_model", self.model.grad_model))
+        elif self.cfg.model == "NPR":
+            if self.cfg.adaptation_target == "model":
+                targets.append(("model", self.model.model))
+            else:
+                # For backward compatibility, support "classifier" for NPR
+                targets.append(("model", self.model.model))
 
         for target_name, target_module in targets:
             for name, module in target_module.named_modules():
@@ -135,50 +149,82 @@ class LGradNORM(nn.Module):
 
                     print(f"[NORM] Adapted {target_name}.{name}")
 
-    def img2grad(self, x: torch.Tensor) -> torch.Tensor:
+    def img2artifact(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Image to Gradient (delegates to wrapped model).
+        Image to Artifact (delegates to wrapped model).
 
         Args:
             x: Input images [B, 3, H, W], range [0, 1]
 
         Returns:
-            Gradient images [B, 3, 256, 256], normalized to [0,1]
+            Artifact images (gradient for LGrad, NPR for NPR)
         """
         self.model.eval()
-        return self.model.img2grad(x)
+        if self.cfg.model == "LGrad":
+            return self.model.img2grad(x)
+        else:  # NPR
+            return self.model.img2npr(x)
 
-    def classify(self, grad: torch.Tensor) -> torch.Tensor:
+    def classify(self, artifact: torch.Tensor) -> torch.Tensor:
         """
-        Classification of Gradient image (delegates to wrapped model).
+        Classification of artifact (delegates to wrapped model).
 
         Args:
-            grad: Gradient images [B, 3, 256, 256], range [0, 1]
+            artifact: Artifact (gradient for LGrad, NPR for NPR)
 
         Returns:
             Logits [B, 1] (positive = fake)
         """
         self.model.eval()
-        return self.model.classify(grad)
+        return self.model.classify(artifact)
 
     def forward(
         self,
         x: torch.Tensor,
-        return_grad: bool = False,
+        return_artifact: bool = False,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward pass with NORM adaptation.
 
         Args:
             x: Input images [B, 3, H, W], range [0, 1]
-            return_grad: If True, also return gradient images
+            return_artifact: If True, also return artifact
 
         Returns:
             logits: [B, 1] (positive = fake)
-            grad (optional): [B, 3, 256, 256] gradient images
+            artifact (optional): Artifact (gradient for LGrad, NPR for NPR)
         """
         self.model.eval()  # Keep in eval mode (but BatchNorm will adapt)
-        return self.model(x, return_grad=return_grad)
+
+        if self.cfg.model == "LGrad":
+            return self.model(x, return_grad=return_artifact)
+        else:  # NPR
+            return self.model(x, return_npr=return_artifact)
+
+    def img2npr(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extract NPR artifact (for NPR model).
+        Delegates to underlying model.
+        """
+        if self.cfg.model != "NPR":
+            raise AttributeError(f"img2npr is only available for NPR model, got {self.cfg.model}")
+        return self.model.img2npr(x)
+
+    def img2grad(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extract gradient artifact (for LGrad model).
+        Delegates to underlying model.
+        """
+        if self.cfg.model != "LGrad":
+            raise AttributeError(f"img2grad is only available for LGrad model, got {self.cfg.model}")
+        return self.model.img2grad(x)
+
+    def classify(self, artifact: torch.Tensor) -> torch.Tensor:
+        """
+        Classify artifact.
+        Delegates to underlying model.
+        """
+        return self.model.classify(artifact)
 
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -223,23 +269,28 @@ class LGradNORM(nn.Module):
                 break
 
 
-class LGradNORMwithMemory(LGradNORM):
+class UnifiedNORMwithMemory(UnifiedNORM):
     """
     Extended NORM with memory of original source statistics.
 
     Allows resetting to original source distribution after adaptation.
     """
 
-    def __init__(self, lgrad_model, config: NORMConfig):
+    def __init__(self, base_model, config: NORMConfig):
         # Store original statistics before adaptation
         self.original_stats = {}
-        super().__init__(lgrad_model, config)
+        super().__init__(base_model, config)
 
     def _apply_norm_adaptation(self):
         """Apply NORM adaptation while saving original statistics"""
 
         # First, save original statistics
-        for name, module in self.model.classifier.named_modules():
+        if self.cfg.model == "LGrad":
+            target_module = self.model.classifier
+        else:  # NPR
+            target_module = self.model.model
+
+        for name, module in target_module.named_modules():
             if isinstance(module, nn.BatchNorm2d):
                 self.original_stats[name] = {
                     'running_mean': module.running_mean.clone(),
@@ -251,11 +302,21 @@ class LGradNORMwithMemory(LGradNORM):
 
     def reset_to_source(self):
         """Reset all BatchNorm layers to original source statistics"""
-        for name, module in self.model.classifier.named_modules():
+        if self.cfg.model == "LGrad":
+            target_module = self.model.classifier
+        else:  # NPR
+            target_module = self.model.model
+
+        for name, module in target_module.named_modules():
             if isinstance(module, nn.BatchNorm2d) and name in self.original_stats:
                 module.running_mean.copy_(self.original_stats[name]['running_mean'])
                 module.running_var.copy_(self.original_stats[name]['running_var'])
                 print(f"[NORM] Reset {name} to source statistics")
+
+
+# Backward compatibility aliases
+LGradNORM = UnifiedNORM
+LGradNORMwithMemory = UnifiedNORMwithMemory
 
 
 # Utility function for easy usage
@@ -265,7 +326,7 @@ def create_lgrad_norm(
     source_sum: int = 128,
     adaptation_target: str = "classifier",
     device: str = "cuda",
-) -> LGradNORM:
+) -> UnifiedNORM:
     """
     Convenience function to create LGrad model with NORM adaptation.
 
@@ -277,7 +338,7 @@ def create_lgrad_norm(
         device: Device to use
 
     Returns:
-        LGradNORM model ready for inference
+        UnifiedNORM model ready for inference
 
     Example:
         >>> model = create_lgrad_norm(
@@ -300,10 +361,57 @@ def create_lgrad_norm(
     # Apply NORM adaptation
     config = NORMConfig(
         source_sum=source_sum,
+        model="LGrad",
         adaptation_target=adaptation_target,
         device=device,
     )
 
-    model = LGradNORM(lgrad, config)
+    model = UnifiedNORM(lgrad, config)
+
+    return model
+
+
+def create_npr_norm(
+    weights: str,
+    source_sum: int = 128,
+    adaptation_target: str = "model",
+    device: str = "cuda",
+) -> UnifiedNORM:
+    """
+    Convenience function to create NPR model with NORM adaptation.
+
+    Args:
+        weights: Path to NPR model weights
+        source_sum: Accumulated source batch size for weighting
+        adaptation_target: Which part to adapt (use "model" for NPR)
+        device: Device to use
+
+    Returns:
+        UnifiedNORM model ready for inference
+
+    Example:
+        >>> model = create_npr_norm(
+        ...     weights="weights/npr.pth",
+        ...     source_sum=128
+        ... )
+        >>> probs = model.predict_proba(corrupted_images)
+    """
+    from model.NPR.npr_model import NPR
+
+    # Create base NPR model
+    npr = NPR(
+        weights=weights,
+        device=device,
+    )
+
+    # Apply NORM adaptation
+    config = NORMConfig(
+        source_sum=source_sum,
+        model="NPR",
+        adaptation_target=adaptation_target,
+        device=device,
+    )
+
+    model = UnifiedNORM(npr, config)
 
     return model

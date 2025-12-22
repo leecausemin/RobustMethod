@@ -37,10 +37,17 @@ class SGSConfig:
     """
     K: int = 5  # Number of views to sample
 
+    # Model type
+    model: Literal["LGrad", "NPR"] = "LGrad"
+    # "LGrad": Apply to LGrad model
+    # "NPR": Apply to NPR model
+
     # Huber-TV 적용 대상
-    denoise_target: Literal["input", "gradient"] = "gradient"
-    # "input": 원본 이미지에 Huber-TV 적용 후 gradient 추출
-    # "gradient": gradient 추출 후 Huber-TV 적용 (기본값)
+    denoise_target: Literal["input", "artifact"] = "artifact"
+    # "input": 원본 이미지에 Huber-TV 적용 후 artifact 추출
+    # "artifact": artifact 추출 후 Huber-TV 적용 (기본값)
+    #   - LGrad: gradient map에 denoising
+    #   - NPR: NPR artifact에 denoising
 
     # 기본 하이퍼파라미터 (K개의 파라미터 세트를 자동 생성할 때 사용)
     huber_tv_lambda: float = 0.05  # TV regularization strength
@@ -237,113 +244,120 @@ class StochasticAugmenter:
         return self.apply_anisotropic_huber_tv(x)
 
 
-class LGradSGS(nn.Module):
+class UnifiedSGS(nn.Module):
     """
-    LGrad with Stochastic Gradient Smoothing (SGS) using Anisotropic Huber-TV
+    Unified SGS for both LGrad and NPR models with Stochastic Gradient Smoothing (SGS) using Anisotropic Huber-TV
 
-    테스트 시 K개의 Huber-TV denoised view에서 gradient를 추출하고 평균내어
+    테스트 시 K개의 Huber-TV denoised view에서 artifact를 추출하고 평균내어
     고분산 노이즈를 제거하고 진짜 artifact 성분만 보존한다.
 
     Args:
-        lgrad_model: Pre-trained LGrad model
+        base_model: Pre-trained LGrad or NPR model
         config: SGS configuration
 
     Example:
         >>> from model.LGrad.lgrad_model import LGrad
-        >>> from model.method.sgs import LGradSGS, SGSConfig
+        >>> from model.NPR.npr_model import NPR
+        >>> from model.method.sgs import UnifiedSGS, SGSConfig
         >>>
-        >>> # Load base model
-        >>> base_lgrad = LGrad(
-        ...     stylegan_weights="path/to/stylegan.pth",
-        ...     classifier_weights="path/to/classifier.pth",
-        ...     device="cuda"
-        ... )
+        >>> # For LGrad
+        >>> lgrad = LGrad(stylegan_weights="...", classifier_weights="...", device="cuda")
+        >>> config = SGSConfig(K=5, model="LGrad", denoise_target="artifact", device="cuda")
+        >>> model = UnifiedSGS(lgrad, config)
         >>>
-        >>> # Apply SGS with Huber-TV
-        >>> config = SGSConfig(
-        ...     K=5,
-        ...     huber_tv_lambda=0.05,
-        ...     huber_tv_delta=0.01,
-        ...     huber_tv_iterations=3,
-        ...     huber_tv_step_size=0.2,
-        ...     device="cuda"
-        ... )
-        >>> model = LGradSGS(base_lgrad, config)
+        >>> # For NPR
+        >>> npr = NPR(weights="...", device="cuda")
+        >>> config = SGSConfig(K=5, model="NPR", denoise_target="artifact", device="cuda")
+        >>> model = UnifiedSGS(npr, config)
         >>>
         >>> # Use as normal
-        >>> model.model.eval()
         >>> predictions = model.predict_proba(images)
     """
 
-    def __init__(self, lgrad_model, config: SGSConfig):
+    def __init__(self, base_model, config: SGSConfig):
         super().__init__()
         self.cfg = config
         self.device = config.device
 
         # Deep copy to avoid modifying original model
-        self.model = copy.deepcopy(lgrad_model)
+        self.model = copy.deepcopy(base_model)
         self.model.to(self.device)
 
         # Augmenter
         self.augmenter = StochasticAugmenter(config)
 
-        print(f"[SGS] Initialized with K={config.K}, denoise_target={config.denoise_target}")
+        # Validate config
+        if config.model not in ["LGrad", "NPR"]:
+            raise ValueError(f"Unsupported model type: {config.model}")
+
+        print(f"[SGS] Initialized for {config.model} with K={config.K}, denoise_target={config.denoise_target}")
         print(f"[SGS] Base params: λ={config.huber_tv_lambda}, δ={config.huber_tv_delta}, iter={config.huber_tv_iterations}, step={config.huber_tv_step_size}")
         print(f"[SGS] Parameter sets for {config.K} views:")
         for k, (lam, delta, iters, step) in enumerate(config.param_sets):
             print(f"  View {k}: λ={lam:.4f}, δ={delta:.4f}, iter={iters}, step={step:.2f}")
 
-    def extract_smoothed_gradient(self, x: torch.Tensor) -> torch.Tensor:
+    def extract_smoothed_artifact(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Extract gradient and apply K different Huber-TV denoising, then average.
+        Extract artifact and apply K different Huber-TV denoising, then average.
 
-        This is the core of SGS: gradient-space ensemble with edge-preserving denoising.
+        This is the core of SGS: artifact-space ensemble with edge-preserving denoising.
 
-        동작 방식 (denoise_target에 따라):
-        - "gradient" (기본값):
+        동작 방식 (model과 denoise_target에 따라):
+        - LGrad + "artifact":
             1. 입력 이미지 → gradient 추출 (한 번만)
             2. Gradient에 K개의 다른 Huber-TV 파라미터 적용
             3. K개의 denoised gradient를 평균
-        - "input":
+        - LGrad + "input":
             1. 입력 이미지에 K개의 다른 Huber-TV 파라미터 적용
             2. 각 denoised 이미지 → gradient 추출
             3. K개의 gradient를 평균
+        - NPR + "artifact":
+            1. 입력 이미지 → NPR 추출 (한 번만)
+            2. NPR에 K개의 다른 Huber-TV 파라미터 적용
+            3. K개의 denoised NPR을 평균
+        - NPR + "input":
+            1. 입력 이미지에 K개의 다른 Huber-TV 파라미터 적용
+            2. 각 denoised 이미지 → NPR 추출
+            3. K개의 NPR을 평균
 
         Args:
             x: Input images [B, 3, H, W], range [0, 1]
 
         Returns:
-            grad_smoothed: [B, 3, 256, 256] averaged gradient
+            artifact_smoothed: [B, 3, H, W] averaged artifact (gradient for LGrad, NPR for NPR)
         """
         B = x.shape[0]
         K = self.cfg.K
 
-        all_grads = []
+        all_artifacts = []
 
-        if self.cfg.denoise_target == "gradient":
-            # Step 1: Extract gradient from original image (only once!)
-            grad = self.model.img2grad(x)  # [B, 3, 256, 256]
+        if self.cfg.denoise_target == "artifact":
+            # Step 1: Extract artifact from original image (only once!)
+            if self.cfg.model == "LGrad":
+                artifact = self.model.img2grad(x)  # [B, 3, 256, 256]
+            else:  # NPR
+                artifact = self.model.img2npr(x)  # [B, 3, H, W]
 
-            # Step 2: Apply K different Huber-TV denoising to the gradient
+            # Step 2: Apply K different Huber-TV denoising to the artifact
             for k in range(K):
                 # Get parameters for this view
                 lambda_tv, delta, iterations, step_size = self.cfg.param_sets[k]
 
-                # Apply Huber-TV denoising to gradient
+                # Apply Huber-TV denoising to artifact
                 if k == 0:
-                    # First view: original gradient (no denoising)
-                    grad_k = grad
+                    # First view: original artifact (no denoising)
+                    artifact_k = artifact
                 else:
-                    # Apply Huber-TV denoising to gradient with view-specific parameters
-                    grad_k = self.augmenter.apply_anisotropic_huber_tv(
-                        grad,
+                    # Apply Huber-TV denoising to artifact with view-specific parameters
+                    artifact_k = self.augmenter.apply_anisotropic_huber_tv(
+                        artifact,
                         lambda_tv=lambda_tv,
                         huber_delta=delta,
                         iterations=iterations,
                         step_size=step_size
                     )
 
-                all_grads.append(grad_k)
+                all_artifacts.append(artifact_k)
 
         else:  # denoise_target == "input"
             # Step 1: Apply K different Huber-TV denoising to input image
@@ -365,43 +379,46 @@ class LGradSGS(nn.Module):
                         step_size=step_size
                     )
 
-                # Step 2: Extract gradient from denoised input
-                grad_k = self.model.img2grad(x_k)
+                # Step 2: Extract artifact from denoised input
+                if self.cfg.model == "LGrad":
+                    artifact_k = self.model.img2grad(x_k)
+                else:  # NPR
+                    artifact_k = self.model.img2npr(x_k)
 
-                all_grads.append(grad_k)
+                all_artifacts.append(artifact_k)
 
-        # Step 3: Average K gradients
-        all_grads = torch.stack(all_grads, dim=0)  # [K, B, 3, 256, 256]
-        grad_smoothed = all_grads.mean(dim=0)  # [B, 3, 256, 256]
+        # Step 3: Average K artifacts
+        all_artifacts = torch.stack(all_artifacts, dim=0)  # [K, B, 3, H, W]
+        artifact_smoothed = all_artifacts.mean(dim=0)  # [B, 3, H, W]
 
-        return grad_smoothed
+        return artifact_smoothed
 
     def forward(
         self,
         x: torch.Tensor,
-        return_grad: bool = False,
+        return_artifact: bool = False,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward pass with Stochastic Gradient Smoothing.
 
         Args:
             x: Input images [B, 3, H, W], range [0, 1]
-            return_grad: If True, also return smoothed gradient
+            return_artifact: If True, also return smoothed artifact
 
         Returns:
             logits: [B, 1] (positive = fake)
-            grad (optional): [B, 3, 256, 256] smoothed gradient
+            artifact (optional): [B, 3, H, W] smoothed artifact
         """
         self.model.eval()
 
-        # Extract smoothed gradient (K-view ensemble)
-        grad = self.extract_smoothed_gradient(x)
+        # Extract smoothed artifact (K-view ensemble)
+        artifact = self.extract_smoothed_artifact(x)
 
-        # Classify with smoothed gradient
-        logits = self.model.classify(grad)
+        # Classify with smoothed artifact
+        logits = self.model.classify(artifact)
 
-        if return_grad:
-            return logits, grad
+        if return_artifact:
+            return logits, artifact
 
         return logits
 
@@ -434,18 +451,22 @@ class LGradSGS(nn.Module):
         return torch.sigmoid(logits).squeeze(1)
 
 
+# Backward compatibility alias
+LGradSGS = UnifiedSGS
+
+
 # Utility function for easy usage
 def create_lgrad_sgs(
     stylegan_weights: str,
     classifier_weights: str,
     K: int = 5,
-    denoise_target: Literal["input", "gradient"] = "gradient",
+    denoise_target: Literal["input", "artifact"] = "artifact",
     huber_tv_lambda: float = 0.05,
     huber_tv_delta: float = 0.01,
     huber_tv_iterations: int = 3,
     huber_tv_step_size: float = 0.2,
     device: str = "cuda",
-) -> LGradSGS:
+) -> UnifiedSGS:
     """
     Convenience function to create LGrad model with SGS using Huber-TV.
 
@@ -456,7 +477,7 @@ def create_lgrad_sgs(
         stylegan_weights: Path to StyleGAN discriminator weights
         classifier_weights: Path to ResNet50 classifier weights
         K: Number of stochastic views to ensemble
-        denoise_target: Where to apply Huber-TV ("input" or "gradient")
+        denoise_target: Where to apply Huber-TV ("input" or "artifact")
         huber_tv_lambda: TV regularization strength
         huber_tv_delta: Huber threshold (작을수록 L1 성향↑, outlier에 robust)
         huber_tv_iterations: Number of gradient descent iterations
@@ -464,7 +485,7 @@ def create_lgrad_sgs(
         device: Device to use
 
     Returns:
-        LGradSGS model ready for inference
+        UnifiedSGS model ready for inference
 
     Example:
         >>> # Denoise gradient (기본값)
@@ -472,7 +493,7 @@ def create_lgrad_sgs(
         ...     stylegan_weights="weights/stylegan.pth",
         ...     classifier_weights="weights/classifier.pth",
         ...     K=5,
-        ...     denoise_target="gradient",
+        ...     denoise_target="artifact",
         ...     huber_tv_lambda=0.05
         ... )
         >>>
@@ -499,6 +520,7 @@ def create_lgrad_sgs(
     # Apply SGS with Huber-TV
     config = SGSConfig(
         K=K,
+        model="LGrad",
         denoise_target=denoise_target,
         huber_tv_lambda=huber_tv_lambda,
         huber_tv_delta=huber_tv_delta,
@@ -507,6 +529,75 @@ def create_lgrad_sgs(
         device=device,
     )
 
-    model = LGradSGS(lgrad, config)
+    model = UnifiedSGS(lgrad, config)
+
+    return model
+
+
+def create_npr_sgs(
+    weights: str,
+    K: int = 5,
+    denoise_target: Literal["input", "artifact"] = "artifact",
+    huber_tv_lambda: float = 0.05,
+    huber_tv_delta: float = 0.01,
+    huber_tv_iterations: int = 3,
+    huber_tv_step_size: float = 0.2,
+    device: str = "cuda",
+) -> UnifiedSGS:
+    """
+    Convenience function to create NPR model with SGS using Huber-TV.
+
+    Args:
+        weights: Path to NPR model weights
+        K: Number of stochastic views to ensemble
+        denoise_target: Where to apply Huber-TV ("input" or "artifact")
+        huber_tv_lambda: TV regularization strength
+        huber_tv_delta: Huber threshold (작을수록 L1 성향↑, outlier에 robust)
+        huber_tv_iterations: Number of gradient descent iterations
+        huber_tv_step_size: Gradient descent step size
+        device: Device to use
+
+    Returns:
+        UnifiedSGS model ready for inference
+
+    Example:
+        >>> # Denoise NPR artifact (기본값)
+        >>> model = create_npr_sgs(
+        ...     weights="weights/npr.pth",
+        ...     K=5,
+        ...     denoise_target="artifact",
+        ...     huber_tv_lambda=0.05
+        ... )
+        >>>
+        >>> # Denoise input image
+        >>> model = create_npr_sgs(
+        ...     weights="weights/npr.pth",
+        ...     K=5,
+        ...     denoise_target="input",
+        ...     huber_tv_lambda=0.05
+        ... )
+        >>> probs = model.predict_proba(corrupted_images)
+    """
+    from model.NPR.npr_model import NPR
+
+    # Create base NPR model
+    npr = NPR(
+        weights=weights,
+        device=device,
+    )
+
+    # Apply SGS with Huber-TV
+    config = SGSConfig(
+        K=K,
+        model="NPR",
+        denoise_target=denoise_target,
+        huber_tv_lambda=huber_tv_lambda,
+        huber_tv_delta=huber_tv_delta,
+        huber_tv_iterations=huber_tv_iterations,
+        huber_tv_step_size=huber_tv_step_size,
+        device=device,
+    )
+
+    model = UnifiedSGS(npr, config)
 
     return model
