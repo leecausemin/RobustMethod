@@ -72,23 +72,25 @@ class LGrad(nn.Module):
         Returns:
             Gradient images [B, 3, 256, 256], normalized to [0,1]
         """
-        x = self.img2grad_transform(x)
-        x = x.to(self.device).requires_grad_(True)
+        # Enable gradient computation even in eval mode
+        with torch.enable_grad():
+            x = self.img2grad_transform(x)
+            x = x.to(self.device).requires_grad_(True)
 
-        # Forward through discriminator
-        out = self.grad_model(x)
+            # Forward through discriminator
+            out = self.grad_model(x)
 
-        # Compute gradient w.r.t. input
-        self.grad_model.zero_grad()
-        grad = torch.autograd.grad(
-            outputs=out.sum(),
-            inputs=x,
-            create_graph=True,
-            retain_graph=True,
-        )[0]
+            # Compute gradient w.r.t. input
+            self.grad_model.zero_grad()
+            grad = torch.autograd.grad(
+                outputs=out.sum(),
+                inputs=x,
+                create_graph=True,
+                retain_graph=True,
+            )[0]
 
-        # Detach gradient to prevent graph retention
-        grad = grad.detach()
+            # Detach gradient to prevent graph retention
+            grad = grad.detach()
 
         # Normalize gradient to [0, 1]
         grad = self._normalize_grad(grad)
