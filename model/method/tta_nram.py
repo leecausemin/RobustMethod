@@ -942,6 +942,432 @@ def inference_with_tta(
 # Utility Functions
 # ============================================================================
 
+# ============================================================================
+# Phase 6.5: Class-Conditional TTA-NRAM (Option B)
+# ============================================================================
+
+class ClassConditionalTTANRAM(nn.Module):
+    """
+    Class-conditional TTA-NRAM with separate NRAM modules for Real and Fake.
+
+    KEY INNOVATION:
+    - 2 separate NRAM modules (real_nram, fake_nram)
+    - Pseudo-label based routing
+    - Class-wise feature statistics
+    - 2 separate memory banks (optional)
+
+    WHY THIS WORKS:
+    - Real images: natural textures, specific statistical properties
+    - Fake images: GAN artifacts, upsampling traces, different statistics
+    - Mixing them causes incorrect variance estimation
+    - Separate treatment allows each class to be optimized independently
+
+    Architecture:
+    ```
+    Input Image [B, 3, H, W]
+        ↓
+    Base Model (frozen) → layer4 features [B, 2048, 7, 7]
+        ↓
+    Pseudo-Label Generation (quick prediction)
+        ↓
+    ┌─────────────────┬─────────────────┐
+    │   Real NRAM     │   Fake NRAM     │
+    │  (for real)     │  (for fake)     │
+    └─────────────────┴─────────────────┘
+        ↓
+    Merged Enhanced Features [B, 2048, 7, 7]
+        ↓
+    Base Classifier (avgpool + fc) - Pre-trained!
+        ↓
+    Logits [B, 1]
+    ```
+
+    Args:
+        base_model: Pre-trained LGrad or NPR model
+        config: TTANRAMConfig
+    """
+
+    def __init__(self, base_model: nn.Module, config: TTANRAMConfig):
+        super().__init__()
+        self.config = config
+        self.base_model = base_model
+
+        # Freeze base model completely
+        for param in base_model.parameters():
+            param.requires_grad = False
+
+        # Auto-detect target layer if not specified
+        if config.target_layer is None:
+            config.target_layer = self._get_default_target_layer()
+
+        # Feature extractor (hook-based)
+        self.feature_extractor = FeatureExtractor(
+            base_model,
+            config.target_layer
+        )
+
+        # Get channel count for target layer
+        channels = self._get_layer_channels(config.target_layer)
+
+        # ========================================
+        # KEY: 2 Separate NRAM Modules
+        # ========================================
+        self.real_nram = TestTimeAdaptiveNRAM(channels, config).to(config.device)
+        self.fake_nram = TestTimeAdaptiveNRAM(channels, config).to(config.device)
+
+        # ========================================
+        # KEY: 2 Separate Memory Banks
+        # ========================================
+        if config.enable_memory_bank:
+            self.real_memory_bank = MemoryBank(
+                num_channels=channels,
+                memory_size=config.memory_size,
+                confidence_threshold=config.confidence_threshold
+            ).to(config.device)
+
+            self.fake_memory_bank = MemoryBank(
+                num_channels=channels,
+                memory_size=config.memory_size,
+                confidence_threshold=config.confidence_threshold
+            ).to(config.device)
+        else:
+            self.real_memory_bank = None
+            self.fake_memory_bank = None
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        test_time: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Dict]]:
+        """
+        Forward pass with class-conditional routing.
+
+        Args:
+            images: [B, 3, H, W]
+            test_time: Boolean
+                - False: Normal forward (no TTA, no routing)
+                - True: TTA mode (with pseudo-label routing)
+
+        Returns:
+            logits: [B, 1]
+            features: [B, C] or None
+            debug_info: Dict or None
+        """
+        # ========================================
+        # Step 1: Base Model → Extract Features
+        # ========================================
+        with torch.no_grad():
+            _ = self.base_model(images)
+
+        features = self.feature_extractor.features[self.config.target_layer]  # [B, C, H, W]
+        B, C, H, W = features.shape
+
+        # ========================================
+        # Step 2: Generate Pseudo-Labels (TTA only)
+        # ========================================
+        if test_time:
+            with torch.no_grad():
+                # Get classifier
+                if self.config.model == "LGrad":
+                    classifier = self.base_model.classifier
+                elif self.config.model == "NPR":
+                    classifier = self.base_model.resnet
+                else:
+                    raise ValueError(f"Unknown model: {self.config.model}")
+
+                # Quick prediction for routing
+                feat_pooled_init = classifier.avgpool(features)
+                feat_pooled_init = torch.flatten(feat_pooled_init, 1)
+                logits_init = classifier.fc(feat_pooled_init)
+                prob_init = torch.sigmoid(logits_init).squeeze(-1)  # [B]
+
+                # Pseudo-labels: 0=real, 1=fake
+                pseudo_labels = (prob_init > 0.5).long()  # [B]
+        else:
+            pseudo_labels = None
+
+        # ========================================
+        # Step 3: Apply Class-Conditional NRAM
+        # ========================================
+        if test_time and pseudo_labels is not None:
+            # Separate by class
+            real_mask = (pseudo_labels == 0)  # [B]
+            fake_mask = (pseudo_labels == 1)  # [B]
+
+            n_real = real_mask.sum().item()
+            n_fake = fake_mask.sum().item()
+
+            # Initialize output
+            feat_enhanced = torch.zeros_like(features)  # [B, C, H, W]
+            debug_info_combined = {
+                'n_real': n_real,
+                'n_fake': n_fake,
+                'pseudo_labels': pseudo_labels,
+            }
+
+            # Process Real samples
+            if n_real > 0:
+                F_real = features[real_mask]  # [n_real, C, H, W]
+                F_real_enhanced, weights_real, noise_real, debug_real = self.real_nram(
+                    F_real,
+                    test_time=True
+                )
+                feat_enhanced[real_mask] = F_real_enhanced
+                debug_info_combined['real_noise_mean'] = noise_real.mean().item()
+                debug_info_combined['real_weights_mean'] = weights_real.mean().item()
+
+            # Process Fake samples
+            if n_fake > 0:
+                F_fake = features[fake_mask]  # [n_fake, C, H, W]
+                F_fake_enhanced, weights_fake, noise_fake, debug_fake = self.fake_nram(
+                    F_fake,
+                    test_time=True
+                )
+                feat_enhanced[fake_mask] = F_fake_enhanced
+                debug_info_combined['fake_noise_mean'] = noise_fake.mean().item()
+                debug_info_combined['fake_weights_mean'] = weights_fake.mean().item()
+
+            debug_info = debug_info_combined
+        else:
+            # No routing: use average of both NRAMs (conservative)
+            feat_real_enhanced, _, _, _ = self.real_nram(features, test_time=False)
+            feat_fake_enhanced, _, _, _ = self.fake_nram(features, test_time=False)
+            feat_enhanced = 0.5 * feat_real_enhanced + 0.5 * feat_fake_enhanced
+            debug_info = None
+
+        # ========================================
+        # Step 4: Use Base Classifier
+        # ========================================
+        if self.config.model == "LGrad":
+            classifier = self.base_model.classifier
+        elif self.config.model == "NPR":
+            classifier = self.base_model.resnet
+        else:
+            raise ValueError(f"Unknown model: {self.config.model}")
+
+        feat_pooled = classifier.avgpool(feat_enhanced)
+        feat_pooled = torch.flatten(feat_pooled, 1)
+        logits = classifier.fc(feat_pooled)
+
+        # ========================================
+        # Return
+        # ========================================
+        if test_time:
+            return logits, feat_pooled, debug_info
+        else:
+            return logits, None, None
+
+    def update_memory(self, features: torch.Tensor, logits: torch.Tensor, pseudo_labels: torch.Tensor):
+        """
+        Update class-conditional memory banks.
+
+        Args:
+            features: [B, C] - Enhanced features
+            logits: [B, 1] - Final predictions
+            pseudo_labels: [B] - 0=real, 1=fake
+        """
+        if self.real_memory_bank is None or self.fake_memory_bank is None:
+            return
+
+        # Confidence
+        prob = torch.sigmoid(logits).squeeze(-1)  # [B]
+        confidence = torch.maximum(prob, 1 - prob)  # [B]
+
+        # Separate by class
+        real_mask = (pseudo_labels == 0)
+        fake_mask = (pseudo_labels == 1)
+
+        # Update real memory bank
+        if real_mask.sum() > 0:
+            self.real_memory_bank.update(
+                features[real_mask],
+                confidence[real_mask]
+            )
+
+        # Update fake memory bank
+        if fake_mask.sum() > 0:
+            self.fake_memory_bank.update(
+                features[fake_mask],
+                confidence[fake_mask]
+            )
+
+    def reset_memory(self):
+        """Reset both memory banks."""
+        if self.real_memory_bank is not None:
+            self.real_memory_bank.reset()
+        if self.fake_memory_bank is not None:
+            self.fake_memory_bank.reset()
+
+    def _get_default_target_layer(self) -> str:
+        """Auto-detect target layer based on model type."""
+        if self.config.model == "LGrad":
+            return 'classifier.layer4'
+        elif self.config.model == "NPR":
+            return 'resnet.layer4'
+        else:
+            raise ValueError(f"Unknown model type: {self.config.model}")
+
+    def _get_layer_channels(self, layer_name: str) -> int:
+        """Get number of output channels for a layer."""
+        device = self.config.device
+        dummy_input = torch.zeros(1, 3, 224, 224).to(device)
+
+        with torch.no_grad():
+            _ = self.base_model(dummy_input)
+
+        feature = self.feature_extractor.features[layer_name]
+        return feature.shape[1]
+
+
+def inference_with_tta_conditional(
+    model: ClassConditionalTTANRAM,
+    images: torch.Tensor,
+    config: TTANRAMConfig,
+    return_debug: bool = False
+) -> Dict:
+    """
+    Test-time adaptation for ClassConditionalTTANRAM.
+
+    KEY DIFFERENCES from inference_with_tta:
+    - Tracks pseudo-labels throughout TTA
+    - Updates real_nram and fake_nram separately
+    - Updates class-specific memory banks
+
+    PROCESS:
+    1. Initial forward (no TTA)
+    2. Generate pseudo-labels
+    3. TTA loop (5 steps):
+        - Forward with class-conditional routing
+        - Compute self-supervised loss
+        - Update real_nram and fake_nram separately
+    4. Final forward
+    5. Update class-specific memory banks
+
+    Args:
+        model: ClassConditionalTTANRAM model
+        images: [B, 3, H, W]
+        config: TTANRAMConfig
+        return_debug: Whether to return debug info
+
+    Returns:
+        dict with predictions, pseudo_labels, and optional debug info
+    """
+    device = config.device
+    images = images.to(device)
+
+    # ========================================
+    # Phase 1: Initial Forward (No TTA)
+    # ========================================
+    model.eval()
+    with torch.no_grad():
+        logits_initial, _, _ = model(images, test_time=False)
+        pred_initial = torch.sigmoid(logits_initial)
+
+    # ========================================
+    # Phase 2: Enable Gradients for NRAM Only
+    # ========================================
+    # Freeze everything except real_nram and fake_nram
+    for name, param in model.named_parameters():
+        if 'real_nram' in name or 'fake_nram' in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+
+    # TTA loss function
+    tta_loss_fn = TTALoss(weights=config.tta_loss_weights)
+
+    # ========================================
+    # Phase 3: TTA Loop
+    # ========================================
+    tta_history = []
+    pseudo_labels_track = None
+
+    for step in range(config.tta_steps):
+        # Forward with test_time=True (includes pseudo-label generation)
+        logits, features, debug = model(images, test_time=True)
+
+        # Track pseudo-labels (from first forward)
+        if step == 0 and debug is not None:
+            pseudo_labels_track = debug.get('pseudo_labels', None)
+
+        # Compute self-supervised loss
+        loss_dict = tta_loss_fn(logits)
+        loss = loss_dict['total']
+
+        # Backward (both NRAMs get gradients)
+        loss.backward()
+
+        # Manual gradient update
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    param.data = param.data - config.tta_lr * param.grad
+                    param.grad.zero_()
+
+        # Record history
+        prob = torch.sigmoid(logits).detach()
+        tta_history.append({
+            'step': step,
+            'loss': loss.item(),
+            'entropy': loss_dict['entropy'],
+            'mean_prob': prob.mean().item(),
+        })
+
+        # Log class-wise info
+        if debug is not None:
+            tta_history[-1]['n_real'] = debug.get('n_real', 0)
+            tta_history[-1]['n_fake'] = debug.get('n_fake', 0)
+
+    # ========================================
+    # Phase 4: Final Prediction
+    # ========================================
+    model.eval()
+    with torch.no_grad():
+        logits_final, features_final, debug_final = model(images, test_time=True)
+        pred_final = torch.sigmoid(logits_final)
+
+        # Get final pseudo-labels
+        if debug_final is not None:
+            pseudo_labels_final = debug_final.get('pseudo_labels', None)
+        else:
+            pseudo_labels_final = pseudo_labels_track
+
+    # ========================================
+    # Phase 5: Update Memory Banks (Class-Conditional)
+    # ========================================
+    if model.real_memory_bank is not None and pseudo_labels_final is not None:
+        with torch.no_grad():
+            model.update_memory(features_final, logits_final, pseudo_labels_final)
+
+    # ========================================
+    # Phase 6: Disable Gradients
+    # ========================================
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # ========================================
+    # Prepare Results
+    # ========================================
+    results = {
+        'predictions': pred_final.cpu(),
+        'logits': logits_final.cpu(),
+        'initial_predictions': pred_initial.cpu(),
+        'improvement': (pred_final - pred_initial).mean().item(),
+        'pseudo_labels': pseudo_labels_final.cpu() if pseudo_labels_final is not None else None,
+    }
+
+    if return_debug:
+        results['tta_history'] = tta_history
+        results['debug_initial'] = None
+        results['debug_final'] = debug_final
+
+    return results
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
 def count_parameters(model: nn.Module) -> Dict[str, int]:
     """
     Count parameters in model (total, trainable, frozen).
@@ -990,4 +1416,8 @@ def print_model_info(model: UnifiedTTANRAM):
 
 if __name__ == "__main__":
     print("TTA-NRAM module loaded successfully!")
-    print("Use 'from model.method.tta_nram import UnifiedTTANRAM, TTANRAMConfig'")
+    print("\nAvailable models:")
+    print("  - UnifiedTTANRAM: Single NRAM for all samples")
+    print("  - ClassConditionalTTANRAM: Separate NRAMs for Real/Fake (recommended)")
+    print("\nUsage:")
+    print("  from model.method.tta_nram import ClassConditionalTTANRAM, TTANRAMConfig, inference_with_tta_conditional")
