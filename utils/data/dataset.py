@@ -54,7 +54,7 @@ class CorruptedDataset(Dataset):
                                     "corruption": corruption,
                                     "filename": img_path.name,
                                 })
-                
+
     def __len__(self) -> int:
         return len(self.samples)
     
