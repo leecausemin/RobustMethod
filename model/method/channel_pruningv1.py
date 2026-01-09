@@ -40,6 +40,72 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class RunningStats:
+    """
+    Online statistics computation using Welford's algorithm
+    Computes running mean and variance without storing all data
+    """
+    def __init__(self, num_channels: int, device: str = "cuda"):
+        self.device = device
+        self.count = 0
+        self.mean = torch.zeros(num_channels, device=device)
+        self.M2 = torch.zeros(num_channels, device=device)  # Sum of squared differences
+
+    def update(self, batch: torch.Tensor):
+        """
+        Update running statistics with new batch (VECTORIZED - FAST!)
+
+        Args:
+            batch: [B, C, H, W] or [B, C] tensor
+        """
+        # Reduce spatial dimensions if needed
+        if batch.dim() == 4:
+            # [B, C, H, W] -> [N, C] where N = B*H*W
+            B, C, H, W = batch.shape
+            batch_flat = batch.permute(0, 2, 3, 1).reshape(-1, C)
+        elif batch.dim() == 2:
+            # [B, C] -> already flat
+            batch_flat = batch
+        else:
+            raise ValueError(f"Unexpected batch shape: {batch.shape}")
+
+        # Batch statistics (GPU vectorized!)
+        n_new = batch_flat.shape[0]
+        mean_new = batch_flat.mean(dim=0)
+        var_new = batch_flat.var(dim=0, unbiased=False)  # Population variance
+
+        # Welford's algorithm for combining two sets of statistics
+        n_old = self.count
+        n_total = n_old + n_new
+
+        if n_old == 0:
+            # First batch
+            self.mean = mean_new.clone()
+            self.M2 = var_new * n_new
+            self.count = n_new
+        else:
+            # Combine statistics (parallel algorithm)
+            delta = mean_new - self.mean
+            self.mean = (n_old * self.mean + n_new * mean_new) / n_total
+            self.M2 = self.M2 + var_new * n_new + delta**2 * n_old * n_new / n_total
+            self.count = n_total
+
+    def get_stats(self) -> Dict[str, torch.Tensor]:
+        """Get mean, variance, and std"""
+        if self.count < 2:
+            var = torch.zeros_like(self.mean)
+        else:
+            var = self.M2 / self.count
+
+        std = var.sqrt()
+
+        return {
+            'mean': self.mean.clone(),
+            'var': var.clone(),
+            'std': std.clone(),
+        }
+
+
 @dataclass
 class CPv1Config:
     """Configuration for Channel Pruning v1 (Gradient-Pattern-Aware)"""
@@ -100,7 +166,10 @@ def compute_separated_statistics(
     max_batches: Optional[int] = None,
 ) -> Dict[str, Dict[str, Dict[str, torch.Tensor]]]:
     """
-    Compute separated channel-wise statistics for Real and Fake
+    Compute separated channel-wise statistics for Real and Fake (MEMORY EFFICIENT)
+
+    Uses online statistics computation (Welford's algorithm) to avoid storing all activations.
+    Memory usage: O(num_layers * num_channels) instead of O(num_layers * num_batches * batch_size * channels * H * W)
 
     Args:
         model: Pre-trained model (LGrad or NPR)
@@ -134,21 +203,27 @@ def compute_separated_statistics(
                 if 'grad_model' not in name:
                     target_layers.append(name)
 
-    print(f"[CPv1] Computing separated statistics for {len(target_layers)} layers...")
+    print(f"[CPv1] Computing separated statistics for {len(target_layers)} layers (ONLINE MODE)...")
 
-    # Storage for activations (will separate by label after collection)
-    all_activations = {name: [] for name in target_layers}
-    all_labels = []
+    # Storage for current batch activations only
+    current_activations = {}
+
+    # Initialize running statistics for each layer
+    running_stats = {}
+    for layer_name in target_layers:
+        running_stats[layer_name] = {
+            'real': None,  # Will be initialized on first batch
+            'fake': None,
+        }
 
     # Register hooks
     handles = []
 
     def make_hook(layer_name):
         def hook(module, input, output):
-            # output: [B, C, H, W] or [B, C]
-            # Store on CPU immediately to save GPU memory
+            # Store current batch activation only (will be deleted after processing)
             if output.dim() >= 2:
-                all_activations[layer_name].append(output.detach().cpu())
+                current_activations[layer_name] = output.detach()
         return hook
 
     for name in target_layers:
@@ -156,9 +231,9 @@ def compute_separated_statistics(
         handle = module.register_forward_hook(make_hook(name))
         handles.append(handle)
 
-    # Collect activations
+    # Process batches
     total_batches = max_batches if max_batches is not None else len(dataloader)
-    pbar = tqdm(enumerate(dataloader), total=total_batches, desc="Computing separated statistics")
+    pbar = tqdm(enumerate(dataloader), total=total_batches, desc="Computing separated statistics (online)")
 
     for batch_idx, batch in pbar:
         if max_batches is not None and batch_idx >= max_batches:
@@ -172,9 +247,12 @@ def compute_separated_statistics(
             raise ValueError("DataLoader must provide (images, labels) tuples for separated statistics!")
 
         images = images.to(device)
-        labels = labels.cpu()  # Keep on CPU
+        labels = labels.to(device)
 
-        # Forward pass
+        # Clear current activations
+        current_activations.clear()
+
+        # Forward pass (hooks will capture activations)
         try:
             with torch.no_grad():
                 _ = model(images)
@@ -187,11 +265,35 @@ def compute_separated_statistics(
                 else:
                     raise
 
-        # Store labels for this batch
-        all_labels.append(labels)
+        # Process activations for each layer
+        for layer_name in target_layers:
+            if layer_name not in current_activations:
+                continue
 
-        # Clear GPU memory
-        del images
+            acts = current_activations[layer_name]  # [B, C, H, W] or [B, C]
+
+            # Initialize running stats on first batch
+            if running_stats[layer_name]['real'] is None:
+                C = acts.shape[1]
+                running_stats[layer_name]['real'] = RunningStats(C, device)
+                running_stats[layer_name]['fake'] = RunningStats(C, device)
+
+            # Split by label
+            real_mask = (labels == 0)
+            fake_mask = (labels == 1)
+
+            # Update running statistics
+            if real_mask.any():
+                real_acts = acts[real_mask]
+                running_stats[layer_name]['real'].update(real_acts)
+
+            if fake_mask.any():
+                fake_acts = acts[fake_mask]
+                running_stats[layer_name]['fake'].update(fake_acts)
+
+        # Clear activations and free memory
+        current_activations.clear()
+        del images, labels
         if device.startswith('cuda'):
             torch.cuda.empty_cache()
 
@@ -199,73 +301,38 @@ def compute_separated_statistics(
     for handle in handles:
         handle.remove()
 
-    # Concatenate all labels
-    all_labels_tensor = torch.cat(all_labels, dim=0)  # [Total_N]
-
-    # Separate activations by label
+    # Collect final statistics
     separated_stats = {}
 
     for layer_name in target_layers:
-        if len(all_activations[layer_name]) == 0:
+        if running_stats[layer_name]['real'] is None:
             print(f"  Warning: No activations collected for {layer_name}, skipping...")
             continue
 
-        # Concatenate all activations
-        all_acts = torch.cat(all_activations[layer_name], dim=0)  # [Total_N, C, ...]
+        real_stats = running_stats[layer_name]['real'].get_stats()
+        fake_stats = running_stats[layer_name]['fake'].get_stats()
 
-        # Check shape match
-        if all_acts.shape[0] != all_labels_tensor.shape[0]:
-            print(f"  Warning: Shape mismatch for {layer_name}: acts={all_acts.shape[0]}, labels={all_labels_tensor.shape[0]}, skipping...")
-            continue
-
-        # Split by label
-        real_mask = (all_labels_tensor == 0)
-        fake_mask = (all_labels_tensor == 1)
-
-        all_real = all_acts[real_mask]  # [N_real, C, ...]
-        all_fake = all_acts[fake_mask]  # [N_fake, C, ...]
-
-        if len(all_real) == 0 or len(all_fake) == 0:
+        if running_stats[layer_name]['real'].count == 0 or running_stats[layer_name]['fake'].count == 0:
             print(f"  Warning: {layer_name} has no real or fake samples, skipping...")
             continue
 
-        # Compute statistics per label
-        stats = {'real': {}, 'fake': {}}
-
-        for label_name, acts in [('real', all_real), ('fake', all_fake)]:
-            if acts.dim() == 4:
-                # Spatial: [N, C, H, W]
-                mean = acts.mean(dim=[0, 2, 3])
-                var = acts.var(dim=[0, 2, 3])
-            elif acts.dim() == 2:
-                # Fully connected: [N, C]
-                mean = acts.mean(dim=0)
-                var = acts.var(dim=0)
-            else:
-                print(f"  Warning: Unexpected shape {acts.shape} for {layer_name}, skipping...")
-                continue
-
-            std = var.sqrt()
-
-            stats[label_name] = {
-                'mean': mean.cpu(),
-                'var': var.cpu(),
-                'std': std.cpu(),
-            }
-
-        separated_stats[layer_name] = stats
+        # Move to CPU for storage (final stats are small!)
+        separated_stats[layer_name] = {
+            'real': {k: v.cpu() for k, v in real_stats.items()},
+            'fake': {k: v.cpu() for k, v in fake_stats.items()},
+        }
 
         # Print info
-        C = len(stats['real']['mean'])
-        real_mean_range = stats['real']['mean'].min().item(), stats['real']['mean'].max().item()
-        fake_mean_range = stats['fake']['mean'].min().item(), stats['fake']['mean'].max().item()
+        C = len(real_stats['mean'])
+        real_mean_range = real_stats['mean'].min().item(), real_stats['mean'].max().item()
+        fake_mean_range = fake_stats['mean'].min().item(), fake_stats['mean'].max().item()
 
         print(f"  {layer_name}: C={C}")
-        print(f"    Real: mean=[{real_mean_range[0]:.4f}, {real_mean_range[1]:.4f}]")
-        print(f"    Fake: mean=[{fake_mean_range[0]:.4f}, {fake_mean_range[1]:.4f}]")
+        print(f"    Real: mean=[{real_mean_range[0]:.4f}, {real_mean_range[1]:.4f}] (n={running_stats[layer_name]['real'].count})")
+        print(f"    Fake: mean=[{fake_mean_range[0]:.4f}, {fake_mean_range[1]:.4f}] (n={running_stats[layer_name]['fake'].count})")
 
         # Artifact signature
-        artifact_sig = (stats['fake']['mean'] - stats['real']['mean']).abs()
+        artifact_sig = (fake_stats['mean'] - real_stats['mean']).abs()
         print(f"    Artifact signature: mean={artifact_sig.mean():.4f}, max={artifact_sig.max():.4f}")
 
     print(f"[CPv1] Separated statistics computed for {len(separated_stats)} layers")

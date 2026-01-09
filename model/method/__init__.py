@@ -17,6 +17,16 @@ from .channel_pruningv1 import (
     create_lgrad_cpv1,
     create_npr_cpv1,
 )
+from .channel_pruningv2 import (
+    UnifiedChannelPruningV2,
+    CPv2Config,
+    compute_separated_statistics_v2,
+)
+from .channel_pruningv3 import (
+    UnifiedChannelPruningV3,
+    CPv3Config,
+    compute_channel_quality,
+)
 
 __all__ = [
     "LGradNORM", "NORMConfig",
@@ -28,4 +38,6 @@ __all__ = [
     "create_lgrad_crv1", "create_npr_crv1",
     "UnifiedChannelPruningV1", "CPv1Config", "compute_separated_statistics",
     "create_lgrad_cpv1", "create_npr_cpv1",
+    "UnifiedChannelPruningV2", "CPv2Config", "compute_separated_statistics_v2",
+    "UnifiedChannelPruningV3", "CPv3Config", "compute_channel_quality",
 ]
