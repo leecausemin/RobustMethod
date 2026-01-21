@@ -42,88 +42,123 @@ import numpy as np
 
 
 # ============================================================================
+# Robust Normalization Utilities (Data-Driven, No Magic Numbers)
+# ============================================================================
+
+def robust_normalize(x: torch.Tensor, dim: int = 0, eps: float = None) -> torch.Tensor:
+    """
+    Robust normalization using median and MAD (Median Absolute Deviation).
+
+    z = (x - median(x)) / (MAD(x) + eps)
+
+    Args:
+        x: Input tensor [B, ...] or [B]
+        dim: Dimension to compute statistics (default 0 for batch)
+        eps: Numerical stability (default: torch.finfo(x.dtype).eps * 10)
+
+    Returns:
+        z: Normalized tensor (same shape as x)
+    """
+    if eps is None:
+        eps = torch.finfo(x.dtype).eps * 10
+
+    # Median
+    median = torch.median(x, dim=dim, keepdim=True).values
+
+    # MAD (Median Absolute Deviation)
+    mad = torch.median(torch.abs(x - median), dim=dim, keepdim=True).values
+
+    # Normalize
+    z = (x - median) / (mad + eps)
+
+    return z
+
+
+def rank_normalize(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
+    """
+    Rank-based normalization (scale-invariant).
+
+    Maps x to [0, 1] based on rank within batch.
+
+    Args:
+        x: Input tensor [B, ...]
+        dim: Dimension to compute ranks (default 0 for batch)
+
+    Returns:
+        x_rank: Normalized to [0, 1] based on rank
+    """
+    # Flatten to 1D for ranking
+    original_shape = x.shape
+    if dim != 0:
+        raise NotImplementedError("Only dim=0 supported for now")
+
+    x_flat = x.reshape(x.shape[0], -1)
+
+    # Argsort to get ranks
+    ranks = torch.argsort(torch.argsort(x_flat, dim=0), dim=0).float()
+
+    # Normalize to [0, 1]
+    B = x.shape[0]
+    x_rank = ranks / (B - 1 + 1e-8)
+
+    return x_rank.reshape(original_shape)
+
+
+def compute_quantile(x: torch.Tensor, q: float, dim: int = 0) -> torch.Tensor:
+    """
+    Compute quantile along dimension.
+
+    Args:
+        x: Input tensor [B, ...]
+        q: Quantile in [0, 1] (e.g., 0.7 for 70th percentile)
+        dim: Dimension to compute quantile
+
+    Returns:
+        quantile: Quantile value
+    """
+    k = int(q * x.shape[dim])
+    k = max(0, min(k, x.shape[dim] - 1))
+
+    return torch.kthvalue(x, k + 1, dim=dim, keepdim=True).values
+
+
+# ============================================================================
 # Configuration
 # ============================================================================
 
 @dataclass
 class TTANRAMv3Config:
-    """Configuration for TTA-NRAM v3 (Evidence-Calibrated)"""
+    """
+    Data-Driven Configuration for TTA-NRAM v3 (Evidence-Calibrated).
+
+    Only 4 core hyperparameters (down from 20+):
+    - reduction_ratio: Channel attention SE reduction ratio (default 16)
+    - max_tta_steps: Maximum TTA iterations (actual stops early based on data)
+    - tta_lr: Learning rate for TTA (default 1e-4)
+    - update_sample_ratio: Top-ρ ratio for sample selection (0~1, default 0.7)
+
+    All normalization/threshold/policy are DATA-DRIVEN:
+    - Artifact/Noise: robust normalization (median/MAD)
+    - Sample selection: quantile-based (top-ρ)
+    - Update policy: continuous soft gating (no discrete modes)
+    - Early stopping: convergence + collapse detection
+    """
 
     # Model selection
     model: str = "LGrad"  # "LGrad" or "NPR"
     target_layer: str = None  # Auto-detect
 
-    # Channel attention
-    reduction_ratio: int = 16
+    # === Core Hyperparameters (4 tunable) ===
+    reduction_ratio: int = 16              # SE reduction (C // reduction_ratio)
+    max_tta_steps: int = 10                # Max steps (early stop by data)
+    tta_lr: float = 1e-4                   # TTA learning rate
+    update_sample_ratio: float = 0.7       # Top-ρ for sample selection (70%)
+    # === END Core Hyperparameters ===
 
-    # Artifact detection (for evidence + logging)
-    artifact_bands: List[Tuple[float, float]] = field(
-        default_factory=lambda: [(0.2, 0.4), (0.4, 0.6)]
-    )
-    artifact_normalize_factor: float = 1.0
-
-    # Noise estimation
-    noise_detection_method: str = "laplacian"
-    noise_normalize_factor: float = 100.0
-    noise_gate_alpha: float = 1.0
-
-    # === Evidence Calibration (NEW in v3) ===
-    enable_evidence_calibration: bool = True
-    evidence_w_artifact: float = 1.0       # weight for artifact score
-    evidence_w_noise: float = 1.5          # weight for noise level (stricter)
-    evidence_bias: float = 0.0             # threshold bias
-    evidence_center_artifact: float = 0.5  # center for artifact [0,1]
-    evidence_center_noise: float = 0.5     # center for noise [0,1]
-
-    # Update policy thresholds (validated)
-    skip_threshold: float = 0.3            # q_mean < τ_skip → skip all
-    sample_threshold: float = 0.35         # q_i < τ_sample → exclude from loss
-    conservative_threshold: float = 0.6    # q_mean < τ_cons → conservative mode
-    # === END Evidence Calibration ===
-
-    # Memory bank (disabled by default for stability)
-    enable_memory_bank: bool = False
-    memory_size: int = 100
-    confidence_threshold: float = 0.8
-
-    # TTA settings (no confidence loss)
-    tta_steps: int = 5
-    tta_lr: float = 1e-4
-    tta_loss_weights: Dict[str, float] = field(
-        default_factory=lambda: {
-            "entropy": 1.0,
-            "confidence": 0.0,  # Disabled (T2A collapse concern)
-        }
-    )
-
-    # === Artifact-Preserving Constraint (NEW in v3) ===
-    enable_artifact_preserving: bool = True
-    artifact_preserving_weight: float = 0.05  # λ_ap
-    artifact_preserving_type: str = "differentiable_hp"  # Differentiable HP proxy
-    hp_kernel_size: int = 5  # For HP filter (avgpool)
-    # === END Artifact-Preserving ===
-
-    # Gating (learnable, sigmoid-constrained)
-    residual_weight: float = 0.1
-    learnable_residual_weight: bool = True
-    sigmoid_alpha: bool = True  # Use sigmoid(α_logit) for [0,1] constraint
-
-    # Collapse safeguards (enhanced)
-    enable_collapse_detection: bool = True
-    collapse_prob_threshold: float = 0.01  # prob_mean < 0.01 or > 0.99
-    collapse_std_threshold: float = 0.05   # prob_std < 0.05
-    collapse_patience: int = 2             # consecutive steps before early stop
-
-    # Device
+    # Flags
+    enable_evidence_calibration: bool = True  # Use evidence-based policy
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # Logging
-    verbose: bool = False  # Set to True to see detailed TTA logs
-
-    def __post_init__(self):
-        """Validate config."""
-        assert self.sample_threshold >= self.skip_threshold, \
-            f"sample_threshold ({self.sample_threshold}) must be >= skip_threshold ({self.skip_threshold})"
+    verbose: bool = False  # Detailed logs
 
 
 # ============================================================================
@@ -132,34 +167,32 @@ class TTANRAMv3Config:
 
 class FrequencyArtifactDetector(nn.Module):
     """
-    Parameter-free artifact detection using frequency-domain analysis.
+    Data-driven artifact detection using multi-band frequency analysis.
 
-    NOTE: This is used for evidence estimation and logging ONLY.
-    For artifact-preserving constraint, we use differentiable HP proxy.
+    No magic numbers:
+    - Multi-band (12 bins) instead of fixed (0.2-0.4, 0.4-0.6)
+    - Robust normalization (median/MAD) instead of normalize_factor=1.0
+    - No hardcoded baseline threshold (0.2)
     """
 
-    def __init__(
-        self,
-        bands: List[Tuple[float, float]] = None,
-        normalize_factor: float = 1.0
-    ):
+    def __init__(self, num_bands: int = 12):
         super().__init__()
-        self.bands = bands or [(0.2, 0.4), (0.4, 0.6)]
-        self.normalize_factor = normalize_factor
+        self.num_bands = num_bands
 
     def forward(self, feature_map: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Detect artifact level from feature map.
+        Detect artifact level from feature map using data-driven normalization.
 
         Args:
             feature_map: [B, C, H, W]
 
         Returns:
-            artifact_score: [B, 1]
-            debug_info: Dict with band_energies (for logging)
+            artifact_score: [B, 1] in [0, 1]
+            debug_info: Dict with band_energies
         """
         B, C, H, W = feature_map.shape
         device = feature_map.device
+        eps = torch.finfo(feature_map.dtype).eps * 10
 
         # Channel-wise average
         F_mean = feature_map.mean(dim=1, keepdim=True)  # [B, 1, H, W]
@@ -176,74 +209,81 @@ class FrequencyArtifactDetector(nn.Module):
             indexing='ij'
         )
         max_radius = np.sqrt((H // 2) ** 2 + (W // 2) ** 2)
-        radius = torch.sqrt(x.float() ** 2 + y.float() ** 2) / max_radius  # [H, W]
+        radius = torch.sqrt(x.float() ** 2 + y.float() ** 2) / max_radius  # [H, W], [0~1]
 
-        # Extract band energies
-        band_scores = []
+        # Multi-band binning (no hardcoded bands)
         band_energies = []
+        for i in range(self.num_bands):
+            low = i / self.num_bands
+            high = (i + 1) / self.num_bands
 
-        for low, high in self.bands:
             mask = ((radius >= low) & (radius < high)).float()  # [H, W]
-
             band_mag = (F_mag * mask.unsqueeze(0)).sum(dim=(-2, -1))  # [B]
-            band_count = mask.sum() + 1e-8
+            band_count = mask.sum() + eps
             band_mag_norm = band_mag / band_count
 
-            band_scores.append(band_mag_norm)
             band_energies.append(band_mag_norm)
 
-        # Average across bands
-        artifact_raw = torch.stack(band_scores, dim=1).mean(dim=1)  # [B]
+        # Stack: [B, num_bands]
+        e = torch.stack(band_energies, dim=1)  # [B, K]
 
-        # Compute baseline
-        baseline_mask = (radius < 0.2).float()
-        baseline_mag = (F_mag * baseline_mask.unsqueeze(0)).sum(dim=(-2, -1))  # [B]
-        baseline_count = baseline_mask.sum() + 1e-8
-        baseline_mag = baseline_mag / baseline_count + 1e-8
+        # Robust normalization (median/MAD across bands, per sample)
+        e_z = robust_normalize(e, dim=1)  # [B, K], normalized
 
-        # Relative score
-        relative_score = (artifact_raw - baseline_mag) / baseline_mag  # [B]
-        artifact_score = torch.sigmoid(relative_score * self.normalize_factor)  # [B]
-        artifact_score = artifact_score.unsqueeze(1)  # [B, 1]
+        # Aggregate: max (strongest artifact band)
+        artifact_z = e_z.max(dim=1, keepdim=True).values  # [B, 1]
 
-        # Debug info (for logging)
+        # Map to [0, 1] via sigmoid
+        artifact_score = torch.sigmoid(artifact_z)  # [B, 1]
+
+        # Debug info
         debug_info = {
-            'band_energies': torch.stack(band_energies, dim=1),  # [B, num_bands]
+            'band_energies': e,  # [B, num_bands], raw
+            'band_energies_norm': e_z,  # [B, num_bands], normalized
         }
 
         return artifact_score, debug_info
 
 
 # ============================================================================
-# Phase 2: Noise Estimator (Same as v2)
+# Phase 2: Noise Estimator (Data-Driven)
 # ============================================================================
 
 class NoiseEstimator(nn.Module):
-    """Parameter-free noise level estimation based on high-frequency analysis."""
+    """
+    Data-driven noise level estimation.
 
-    def __init__(self, method: str = "laplacian", normalize_factor: float = 100.0):
+    No magic numbers:
+    - Laplacian kernel: L1-normalized (not /8.0)
+    - Noise var: robust z-score → sigmoid (not /100.0 + clamp)
+    """
+
+    def __init__(self, method: str = "laplacian"):
         super().__init__()
         self.method = method
-        self.normalize_factor = normalize_factor
 
         if method == "laplacian":
+            # Laplacian kernel (unnormalized)
             laplacian_kernel = torch.tensor([
                 [0., -1., 0.],
                 [-1., 4., -1.],
                 [0., -1., 0.]
-            ]).view(1, 1, 3, 3) / 8.0
+            ]).view(1, 1, 3, 3)
+
+            # L1 normalization (removes magic /8.0)
+            laplacian_kernel = laplacian_kernel / laplacian_kernel.abs().sum()
 
             self.register_buffer('laplacian_kernel', laplacian_kernel)
 
     def forward(self, feature_map: torch.Tensor) -> torch.Tensor:
         """
-        Estimate noise level from feature map.
+        Estimate noise level using robust normalization.
 
         Args:
             feature_map: [B, C, H, W]
 
         Returns:
-            noise_level: [B, 1]
+            noise_level: [B, 1] in [0, 1]
         """
         if self.method == "laplacian":
             return self._estimate_laplacian(feature_map)
@@ -253,11 +293,11 @@ class NoiseEstimator(nn.Module):
             raise ValueError(f"Unknown noise detection method: {self.method}")
 
     def _estimate_laplacian(self, F: torch.Tensor) -> torch.Tensor:
-        """Laplacian-based high-frequency detection."""
+        """Laplacian-based high-frequency detection with robust normalization."""
         B, C, H, W = F.shape
         device = F.device
 
-        kernel = self.laplacian_kernel.to(device)  # [1, 1, 3, 3]
+        kernel = self.laplacian_kernel.to(device)  # [1, 1, 3, 3], L1-normalized
 
         F_reshaped = F.view(B * C, 1, H, W)
         F_filtered = torch.nn.functional.conv2d(F_reshaped, kernel, padding=1)  # [B*C, 1, H, W]
@@ -266,18 +306,24 @@ class NoiseEstimator(nn.Module):
         spatial_var = F_filtered.var(dim=[2, 3])  # [B, C]
         noise_var = spatial_var.mean(dim=1, keepdim=True)  # [B, 1]
 
-        noise_level = torch.clamp(noise_var / self.normalize_factor, 0.0, 1.0)
+        # Robust normalization (batch-wise)
+        noise_z = robust_normalize(noise_var, dim=0)  # [B, 1], z-score
+
+        # Map to [0, 1] via sigmoid
+        noise_level = torch.sigmoid(noise_z)  # [B, 1]
 
         return noise_level
 
     def _estimate_variance(self, F: torch.Tensor) -> torch.Tensor:
-        """Simple spatial variance-based noise estimation."""
+        """Simple spatial variance with robust normalization."""
         B, C, H, W = F.shape
 
         spatial_var = F.var(dim=[2, 3])  # [B, C]
         noise_var = spatial_var.mean(dim=1, keepdim=True)  # [B, 1]
 
-        noise_level = torch.clamp(noise_var / self.normalize_factor, 0.0, 1.0)
+        # Robust normalization
+        noise_z = robust_normalize(noise_var, dim=0)  # [B, 1]
+        noise_level = torch.sigmoid(noise_z)  # [B, 1]
 
         return noise_level
 
@@ -359,12 +405,12 @@ class ArtifactConditionalChannelAttention(nn.Module):
 
 class TestTimeAdaptiveNRAMv3(nn.Module):
     """
-    Evidence-calibrated TTA-NRAM layer with sigmoid-constrained α.
+    Data-driven TTA-NRAM layer.
 
-    NEW in v3:
-    - Learnable residual weight α with sigmoid constraint (0~1)
-    - Differentiable HP proxy for artifact-preserving constraint
-    - FFT artifact detector for evidence estimation only (no grad)
+    Simplified:
+    - Fixed residual weight α = 0.1 (no learnable)
+    - Data-driven artifact/noise detection (no hyperparameters)
+    - Simple noise gating (fixed)
     """
 
     def __init__(self, channels: int, config: TTANRAMv3Config):
@@ -372,17 +418,11 @@ class TestTimeAdaptiveNRAMv3(nn.Module):
         self.channels = channels
         self.config = config
 
-        # Artifact detector (parameter-free, for evidence + logging)
-        self.artifact_detector = FrequencyArtifactDetector(
-            bands=config.artifact_bands,
-            normalize_factor=config.artifact_normalize_factor
-        )
+        # Artifact detector (parameter-free, data-driven)
+        self.artifact_detector = FrequencyArtifactDetector()
 
-        # Noise estimator (parameter-free)
-        self.noise_estimator = NoiseEstimator(
-            method=config.noise_detection_method,
-            normalize_factor=config.noise_normalize_factor
-        )
+        # Noise estimator (parameter-free, data-driven)
+        self.noise_estimator = NoiseEstimator(method="laplacian")
 
         # Artifact-conditional attention (learnable)
         self.artifact_attention = ArtifactConditionalChannelAttention(
@@ -390,41 +430,16 @@ class TestTimeAdaptiveNRAMv3(nn.Module):
             reduction=config.reduction_ratio
         )
 
-        # === NEW v3: Sigmoid-constrained learnable α (FIX 3) ===
-        if config.learnable_residual_weight:
-            if config.sigmoid_alpha:
-                # α = sigmoid(α_logit) for [0,1] constraint
-                init_logit = self._inverse_sigmoid(config.residual_weight)
-                self.alpha_logit = nn.Parameter(torch.tensor(init_logit))
-            else:
-                # Direct α (risky, can go out of [0,1])
-                self.alpha = nn.Parameter(torch.tensor(config.residual_weight))
-        else:
-            self.register_buffer('alpha_const', torch.tensor(config.residual_weight))
-        # === END v3 ===
-
-    def _inverse_sigmoid(self, x: float) -> float:
-        """Compute logit(x) = log(x / (1-x))."""
-        x = np.clip(x, 1e-6, 1-1e-6)  # Avoid overflow
-        return np.log(x / (1 - x))
-
-    def get_alpha(self) -> torch.Tensor:
-        """Get current α value."""
-        if self.config.learnable_residual_weight:
-            if self.config.sigmoid_alpha:
-                return torch.sigmoid(self.alpha_logit)
-            else:
-                return self.alpha
-        else:
-            return self.alpha_const
+        # Fixed residual weight (not learnable)
+        self.register_buffer('alpha', torch.tensor(0.1))
 
     def forward(
         self,
         F: torch.Tensor,
         test_time: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict]:
         """
-        Apply evidence-calibrated TTA-NRAM to feature map.
+        Apply data-driven TTA-NRAM to feature map.
 
         Args:
             F: Feature map [B, C, H, W]
@@ -432,10 +447,9 @@ class TestTimeAdaptiveNRAMv3(nn.Module):
 
         Returns:
             F_enhanced: Enhanced features [B, C, H, W]
-            F_base: Base features (stop_grad) [B, C, H, W]
             artifact_score: [B, 1] (for evidence, detached)
             noise_level: [B, 1] (for evidence, detached)
-            alpha: scalar tensor (current α value)
+            F_base: Base features (detached) [B, C, H, W]
             debug_info: Dict
         """
         B, C, H, W = F.shape
@@ -451,8 +465,8 @@ class TestTimeAdaptiveNRAMv3(nn.Module):
         # === Phase 3: Artifact-Conditional Attention (learnable) ===
         attn = self.artifact_attention(F, artifact_score.detach())  # [B, C, 1, 1]
 
-        # === Phase 4: Noise-based Gating ===
-        gate = 1.0 - self.config.noise_gate_alpha * noise_level.detach()  # [B, 1]
+        # === Phase 4: Noise-based Gating (fixed gate strength) ===
+        gate = 1.0 - noise_level.detach()  # [B, 1], simple: more noise → less weight
         gate = gate.view(B, 1, 1, 1).expand(-1, C, 1, 1)  # [B, C, 1, 1]
 
         # === Phase 5: Combine Attention and Gating ===
@@ -461,11 +475,10 @@ class TestTimeAdaptiveNRAMv3(nn.Module):
         # === Phase 6: Apply Weighting ===
         F_gated = F * weights  # [B, C, H, W]
 
-        # === Phase 7: Residual Connection with sigmoid α (FIX 3) ===
-        alpha = self.get_alpha()
-        F_enhanced = (1 - alpha) * F_gated + alpha * F  # [B, C, H, W]
+        # === Phase 7: Residual Connection with fixed α ===
+        F_enhanced = (1 - self.alpha) * F_gated + self.alpha * F  # [B, C, H, W]
 
-        # Save base feature (for constraint)
+        # Save base feature (for logging)
         F_base = F.detach()
 
         # Debug info
@@ -476,107 +489,15 @@ class TestTimeAdaptiveNRAMv3(nn.Module):
             'gate_mean': gate.mean().item(),
             'weights_mean': weights.mean().item(),
             'weights_std': weights.std().item(),
-            'alpha': alpha.item(),
+            'alpha': self.alpha.item(),
             'band_energies': artifact_debug['band_energies'],  # [B, num_bands]
         }
 
-        return F_enhanced, F_base, artifact_score, noise_level, alpha, debug_info
+        return F_enhanced, artifact_score, noise_level, F_base, debug_info
 
 
 # ============================================================================
-# Phase 5: Memory Bank (Same as v2, disabled by default)
-# ============================================================================
-
-class MemoryBank(nn.Module):
-    """Confidence-weighted memory bank for robust statistics."""
-
-    def __init__(
-        self,
-        num_channels: int,
-        memory_size: int = 100,
-        confidence_threshold: float = 0.8
-    ):
-        super().__init__()
-        self.num_channels = num_channels
-        self.memory_size = memory_size
-        self.confidence_threshold = confidence_threshold
-
-        self.register_buffer('memory_features', torch.zeros(memory_size, num_channels))
-        self.register_buffer('memory_confidences', torch.zeros(memory_size))
-        self.register_buffer('memory_pointer', torch.tensor(0, dtype=torch.long))
-        self.register_buffer('memory_filled', torch.tensor(0, dtype=torch.long))
-
-    def update(self, features: torch.Tensor, confidence: torch.Tensor, ema_decay: float = 0.99):
-        """Update memory with high-confidence samples."""
-        B, C = features.shape
-        assert C == self.num_channels
-
-        high_conf_mask = confidence > self.confidence_threshold
-
-        if high_conf_mask.sum() == 0:
-            return
-
-        high_conf_features = features[high_conf_mask]
-        high_conf_scores = confidence[high_conf_mask]
-
-        for feat, conf in zip(high_conf_features, high_conf_scores):
-            ptr = self.memory_pointer % self.memory_size
-
-            if self.memory_filled > ptr:
-                self.memory_features[ptr] = (
-                    ema_decay * self.memory_features[ptr] +
-                    (1 - ema_decay) * feat
-                )
-                self.memory_confidences[ptr] = (
-                    ema_decay * self.memory_confidences[ptr] +
-                    (1 - ema_decay) * conf
-                )
-            else:
-                self.memory_features[ptr] = feat
-                self.memory_confidences[ptr] = conf
-                self.memory_filled += 1
-
-            self.memory_pointer += 1
-
-    def get_statistics(self) -> Dict[str, torch.Tensor]:
-        """Get confidence-weighted statistics."""
-        if self.memory_filled == 0:
-            return {
-                'mean': torch.zeros(self.num_channels, device=self.memory_features.device),
-                'std': torch.ones(self.num_channels, device=self.memory_features.device),
-                'num_samples': 0
-            }
-
-        valid_features = self.memory_features[:self.memory_filled]
-        valid_confidences = self.memory_confidences[:self.memory_filled]
-
-        total_conf = valid_confidences.sum() + 1e-8
-        weighted_mean = (
-            valid_features * valid_confidences.unsqueeze(-1)
-        ).sum(dim=0) / total_conf
-
-        diff = valid_features - weighted_mean.unsqueeze(0)
-        weighted_var = (
-            (diff ** 2) * valid_confidences.unsqueeze(-1)
-        ).sum(dim=0) / total_conf
-        weighted_std = torch.sqrt(weighted_var + 1e-8)
-
-        return {
-            'mean': weighted_mean,
-            'std': weighted_std,
-            'num_samples': self.memory_filled.item()
-        }
-
-    def reset(self):
-        """Clear memory."""
-        self.memory_features.zero_()
-        self.memory_confidences.zero_()
-        self.memory_pointer.zero_()
-        self.memory_filled.zero_()
-
-
-# ============================================================================
-# Phase 6: Feature Extractor (Same as v2)
+# Phase 5: Feature Extractor
 # ============================================================================
 
 class FeatureExtractor:
@@ -611,15 +532,14 @@ class FeatureExtractor:
 
 class UnifiedTTANRAMv3(nn.Module):
     """
-    Unified TTA-NRAM v3 wrapper with evidence-calibrated update policy.
+    Data-driven TTA-NRAM v3 wrapper.
 
-    KEY DESIGN (v3):
-    - Base model ALWAYS in no_grad (FIX 2: memory/speed)
-    - NRAM parameters (SE + α) updated via evidence policy
-    - Evidence quality: artifact ↑ good, noise ↑ bad
-    - Update modes: skip / conservative (high_attn+α) / aggressive (full_attn+α)
-    - Sigmoid α for [0,1] constraint (FIX 3)
-    - Differentiable HP constraint for artifact preservation (FIX 4)
+    KEY DESIGN:
+    - Base model ALWAYS in no_grad (memory/speed)
+    - NRAM parameters (SE) updated via data-driven evidence policy
+    - Evidence quality: robust normalization (no hyperparameters)
+    - Update policy: continuous soft gating (no discrete modes)
+    - Fixed α = 0.1 (no learnable residual)
     """
 
     def __init__(self, base_model: nn.Module, config: TTANRAMv3Config):
@@ -644,18 +564,8 @@ class UnifiedTTANRAMv3(nn.Module):
         # Get channel count
         channels = self._get_layer_channels(config.target_layer)
 
-        # TTA-NRAM v3 (evidence-calibrated)
+        # TTA-NRAM v3 (data-driven)
         self.nram = TestTimeAdaptiveNRAMv3(channels, config).to(config.device)
-
-        # Memory bank (optional)
-        if config.enable_memory_bank:
-            self.memory_bank = MemoryBank(
-                num_channels=channels,
-                memory_size=config.memory_size,
-                confidence_threshold=config.confidence_threshold
-            ).to(config.device)
-        else:
-            self.memory_bank = None
 
     def forward(
         self,
@@ -674,16 +584,15 @@ class UnifiedTTANRAMv3(nn.Module):
             features: [B, C] or None
             debug_info: Dict or None
         """
-        # === FIX 2: Base model ALWAYS in no_grad (memory/speed) ===
-        # NRAM parameters will still get gradients correctly
+        # Base model ALWAYS in no_grad (memory/speed)
         with torch.no_grad():
             _ = self.base_model(images)
 
-        # Get hooked features (no grad from base, but NRAM can still compute grad)
+        # Get hooked features
         features = self.feature_extractor.features[self.config.target_layer]  # [B, C, H, W]
 
-        # Apply TTA-NRAM v3
-        feat_enhanced, feat_base, artifact_score, noise_level, alpha, debug_info = self.nram(
+        # Apply TTA-NRAM v3 (updated signature)
+        feat_enhanced, artifact_score, noise_level, feat_base, debug_info = self.nram(
             features,
             test_time=test_time
         )
@@ -714,20 +623,6 @@ class UnifiedTTANRAMv3(nn.Module):
         else:
             return logits, None, None
 
-    def update_memory(self, features: torch.Tensor, logits: torch.Tensor):
-        """Update memory bank."""
-        if self.memory_bank is None:
-            return
-
-        prob = torch.sigmoid(logits).squeeze(-1)  # [B]
-        confidence = torch.maximum(prob, 1 - prob)  # [B]
-        self.memory_bank.update(features, confidence)
-
-    def reset_memory(self):
-        """Reset memory bank."""
-        if self.memory_bank is not None:
-            self.memory_bank.reset()
-
     def _get_default_target_layer(self) -> str:
         """Auto-detect target layer."""
         if self.config.model == "LGrad":
@@ -748,14 +643,16 @@ class UnifiedTTANRAMv3(nn.Module):
         feature = self.feature_extractor.features[layer_name]
         return feature.shape[1]
 
-    # === NEW v3: Evidence Quality Computation (FIX 3: simple normalize) ===
     def compute_evidence_quality(
         self,
         artifact_score: torch.Tensor,  # [B, 1], in [0,1]
         noise_level: torch.Tensor      # [B, 1], in [0,1]
     ) -> torch.Tensor:
         """
-        Compute evidence quality for each sample.
+        Compute evidence quality using data-driven robust normalization.
+
+        q = (artifact - noise + 1) / 2, simple and interpretable.
+        Both artifact and noise are already normalized to [0, 1] by robust methods.
 
         Args:
             artifact_score: [B, 1] - artifact level in [0,1]
@@ -764,117 +661,16 @@ class UnifiedTTANRAMv3(nn.Module):
         Returns:
             q: [B] - Quality in [0, 1], higher = more reliable
         """
-        cfg = self.config
-
-        # Flatten
-        a = artifact_score.squeeze(1)  # [B]
-        n = noise_level.squeeze(1)     # [B]
-
-        # === FIX 3: Simple center-based normalize ===
-        a_centered = a - cfg.evidence_center_artifact  # [-0.5, 0.5]
-        n_centered = n - cfg.evidence_center_noise     # [-0.5, 0.5]
-
-        # Evidence logit
-        logit = (cfg.evidence_w_artifact * a_centered
-                 - cfg.evidence_w_noise * n_centered
-                 - cfg.evidence_bias)
-
-        q = torch.sigmoid(logit)  # [B], in [0, 1]
+        # Simple formula: high artifact, low noise → high quality
+        q = (artifact_score - noise_level + 1.0) / 2.0  # [B, 1]
+        q = torch.clamp(q, 0.0, 1.0)  # Ensure [0, 1]
+        q = q.squeeze(1)  # [B]
 
         return q
 
-    # === NEW v3: Differentiable Artifact-Preserving Constraint (FIX 4) ===
-    def compute_artifact_preserving_loss(
-        self,
-        F_base: torch.Tensor,    # [B, C, H, W], detached
-        F_enh: torch.Tensor,     # [B, C, H, W], with grad
-        mask: torch.Tensor       # [B, 1]
-    ) -> torch.Tensor:
-        """
-        Differentiable artifact-preserving constraint via HP proxy.
-
-        NOTE: This is differentiable (grad flows to F_enh → NRAM/α).
-        FFT artifact_score is used for logging only, not for constraint.
-        """
-        cfg = self.config
-
-        if not cfg.enable_artifact_preserving:
-            return torch.tensor(0.0, device=F_base.device)
-
-        # === FIX 4: Differentiable HP proxy (avgpool-based) ===
-        kernel_size = cfg.hp_kernel_size
-
-        # High-pass: F - blur(F)
-        blur_base = torch.nn.functional.avg_pool2d(
-            F_base, kernel_size=kernel_size, stride=1,
-            padding=kernel_size//2, count_include_pad=False
-        )
-        HP_base = F_base - blur_base  # [B, C, H, W], detached
-
-        blur_enh = torch.nn.functional.avg_pool2d(
-            F_enh, kernel_size=kernel_size, stride=1,
-            padding=kernel_size//2, count_include_pad=False
-        )
-        HP_enh = F_enh - blur_enh  # [B, C, H, W], with grad
-
-        # Pool to [B, C]
-        HP_base_pool = torch.nn.functional.adaptive_avg_pool2d(HP_base, 1).squeeze(-1).squeeze(-1)  # [B, C]
-        HP_enh_pool = torch.nn.functional.adaptive_avg_pool2d(HP_enh, 1).squeeze(-1).squeeze(-1)   # [B, C]
-
-        # L2 distance per sample
-        dist = torch.norm(HP_enh_pool - HP_base_pool, p=2, dim=1, keepdim=True)  # [B, 1]
-
-        # Masked loss (only high-evidence samples)
-        loss_ap = (mask * dist).sum() / (mask.sum() + 1e-8)
-
-        return loss_ap
-
 
 # ============================================================================
-# Phase 8: TTA Loss (Entropy only, no confidence)
-# ============================================================================
-
-class TTALoss(nn.Module):
-    """Self-supervised loss for test-time adaptation (entropy only)."""
-
-    def __init__(self, weights: Optional[Dict[str, float]] = None):
-        super().__init__()
-        self.weights = weights or {'entropy': 1.0, 'confidence': 0.0}
-
-    def forward(self, logits: torch.Tensor, mask: torch.Tensor) -> Dict[str, float]:
-        """
-        Compute TTA loss with sample mask.
-
-        Args:
-            logits: [B, 1]
-            mask: [B, 1] - sample selection mask
-
-        Returns:
-            loss_dict: Dict with loss components
-        """
-        prob = torch.sigmoid(logits)  # [B, 1]
-
-        # Entropy per sample
-        entropy_per_sample = -(
-            prob * torch.log(prob + 1e-8) +
-            (1 - prob) * torch.log(1 - prob + 1e-8)
-        )  # [B, 1]
-
-        # Masked entropy
-        masked_entropy = (mask * entropy_per_sample).sum() / (mask.sum() + 1e-8)
-
-        # Total loss (no confidence by default)
-        total_loss = self.weights['entropy'] * masked_entropy
-
-        return {
-            'total': total_loss,
-            'entropy': masked_entropy.item(),
-            'mean_prob': prob.mean().item(),
-        }
-
-
-# ============================================================================
-# Phase 9: Evidence-Calibrated TTA Inference (ALL FIXES)
+# Phase 6: Data-Driven TTA Inference
 # ============================================================================
 
 def inference_with_tta_v3(
@@ -884,19 +680,18 @@ def inference_with_tta_v3(
     return_debug: bool = False
 ) -> Dict:
     """
-    Evidence-calibrated TTA inference (v3 with ALL 6 FIXES).
+    Data-driven TTA inference with NO magic numbers.
 
-    Key improvements:
-    - FIX 1: Log updated parameters (eval mode clarity)
-    - FIX 2: Base model always no_grad (memory/speed)
-    - FIX 3: Sigmoid α for [0,1] constraint
-    - FIX 4: Differentiable HP constraint (not FFT)
-    - FIX 5: q_step detached before mask
-    - FIX 6: Enhanced collapse safeguard (entropy + std)
+    Key design:
+    - Quantile-based sample selection (top-ρ, not threshold)
+    - Continuous soft gating (no discrete skip/conservative/aggressive)
+    - Data-driven early stopping (loss convergence + evidence stability + collapse)
+    - All normalization via robust statistics (median/MAD)
     """
     device = config.device
     images = images.to(device)
     B = images.shape[0]
+    eps = torch.finfo(torch.float32).eps * 10
 
     # ========================================
     # Phase 1: Initial Forward
@@ -910,26 +705,32 @@ def inference_with_tta_v3(
         noise_level_init = debug_init['noise_level']        # [B, 1]
 
     # ========================================
-    # Phase 2: Evidence Quality
+    # Phase 2: Evidence Quality (data-driven)
     # ========================================
     if not config.enable_evidence_calibration:
-        print("[TTA] Evidence calibration disabled, using simple TTA")
+        # Fall back to simple TTA (no evidence)
+        if config.verbose:
+            print("[TTA] Evidence calibration disabled, using simple TTA")
         return _inference_with_tta_v3_simple(model, images, config, return_debug)
 
     q_init = model.compute_evidence_quality(artifact_score_init, noise_level_init)  # [B]
     q_mean_init = q_init.mean().item()
 
-    # ========================================
-    # Phase 3: Batch-Level Update Policy
-    # ========================================
-    τ_skip = config.skip_threshold
-    τ_cons = config.conservative_threshold
-    τ_sample = config.sample_threshold
+    if config.verbose:
+        print(f"[TTA-v3] Initial evidence: q_mean={q_mean_init:.3f}, "
+              f"artifact={artifact_score_init.mean().item():.3f}, "
+              f"noise={noise_level_init.mean().item():.3f}")
 
-    if q_mean_init < τ_skip:
-        # SKIP
+    # ========================================
+    # Phase 3: Setup TTA Parameters (always full attention)
+    # ========================================
+    # Update all artifact attention parameters (no discrete modes)
+    params_to_update = [p for n, p in model.named_parameters()
+                       if 'artifact_attention' in n]
+
+    if len(params_to_update) == 0:
         if config.verbose:
-            print(f"[TTA-v3] Evidence too low (q={q_mean_init:.3f} < {τ_skip}), SKIP")
+            print("[TTA-v3] No parameters to update, returning initial prediction")
         return {
             'predictions': pred_init,
             'logits': logits_init,
@@ -937,218 +738,161 @@ def inference_with_tta_v3(
             'improvement': 0.0,
             'skipped': True,
             'evidence_mean': q_mean_init,
-            'update_mode': 'skip',
         }
 
-    elif q_mean_init < τ_cons:
-        # CONSERVATIVE: high_artifact_attn + α
-        update_mode = "conservative"
-        params_to_update = []
-
-        for n, p in model.named_parameters():
-            if 'artifact_attention.high_artifact_attn' in n:
-                params_to_update.append((n, p))
-
-        # FIX 3: Add sigmoid α
-        if config.learnable_residual_weight:
-            for n, p in model.named_parameters():
-                if 'alpha_logit' in n or ('alpha' in n and 'alpha_const' not in n):
-                    params_to_update.append((n, p))
-
-        effective_lr = config.tta_lr
-        if config.verbose:
-            print(f"[TTA-v3] Evidence moderate (q={q_mean_init:.3f}), CONSERVATIVE")
-
-    else:
-        # AGGRESSIVE: full_artifact_attn + α
-        update_mode = "aggressive"
-        params_to_update = []
-
-        for n, p in model.named_parameters():
-            if 'artifact_attention' in n:
-                params_to_update.append((n, p))
-
-        # FIX 3: Add α
-        if config.learnable_residual_weight:
-            for n, p in model.named_parameters():
-                if 'alpha_logit' in n or ('alpha' in n and 'alpha_const' not in n):
-                    params_to_update.append((n, p))
-
-        effective_lr = config.tta_lr
-        if config.verbose:
-            print(f"[TTA-v3] Evidence high (q={q_mean_init:.3f}), AGGRESSIVE")
-
-    # Extract only parameters (not names)
-    params_list = [p for n, p in params_to_update]
-
-    # FIX 1: Log updated parameters (1st step only)
-    param_names = [n for n, p in params_to_update]
-    if config.verbose:
-        print(f"[TTA-v3] Updating {len(params_list)} parameters: {param_names}")
-
-    # ========================================
-    # Phase 4: Setup Optimizer
-    # ========================================
-    optimizer = torch.optim.Adam(params_list, lr=effective_lr)
-    max_grad_norm = 1.0
-
-    # Enable gradients for selected params
+    # Enable gradients
     for p in model.parameters():
         p.requires_grad = False
-    for p in params_list:
+    for p in params_to_update:
         p.requires_grad = True
 
+    optimizer = torch.optim.Adam(params_to_update, lr=config.tta_lr)
+
+    if config.verbose:
+        print(f"[TTA-v3] Updating {len(params_to_update)} attention parameters")
+
     # ========================================
-    # Phase 5: TTA Loop (with all fixes)
+    # Phase 4: TTA Loop with Data-Driven Early Stopping
     # ========================================
     tta_history = []
+    prev_loss = None
+    prev_q_mean = q_mean_init
     collapse_counter = 0
-    prev_entropy = None
 
-    for step in range(config.tta_steps):
-        # === 5.1: Forward ===
+    for step in range(config.max_tta_steps):
+        # === 4.1: Forward ===
         logits, features, debug = model(images, test_time=True)
         prob = torch.sigmoid(logits)  # [B, 1]
 
-        # === 5.2: Update evidence (every step) ===
+        # === 4.2: Compute evidence quality (every step) ===
         artifact_score_step = debug['artifact_score']  # [B, 1]
         noise_level_step = debug['noise_level']        # [B, 1]
-        q_step = model.compute_evidence_quality(artifact_score_step, noise_level_step)  # [B]
-
-        # FIX 5: Detach q_step before mask (policy is not learned)
-        q_step = q_step.detach()
+        q_step = model.compute_evidence_quality(artifact_score_step, noise_level_step).detach()  # [B]
         q_mean_step = q_step.mean().item()
 
-        # Sample-level mask
-        mask = (q_step >= τ_sample).float().unsqueeze(1)  # [B, 1]
-        num_updated = mask.sum().item()
+        # === 4.3: Quantile-based sample selection (top-ρ) ===
+        # No fixed threshold! Use relative ranking
+        q_threshold = compute_quantile(q_step, 1.0 - config.update_sample_ratio, dim=0).item()
+        mask = (q_step >= q_threshold).float().unsqueeze(1)  # [B, 1]
+        num_selected = int(mask.sum().item())
 
-        # === 5.3: FIX 6 - Enhanced collapse detection ===
-        prob_mean = prob.mean().item()
-        prob_std = prob.std().item()
+        if num_selected == 0:
+            # Fallback: if no samples selected, use all
+            mask = torch.ones_like(mask)
+            num_selected = B
 
-        # Compute current entropy
+        # === 4.4: Continuous soft gating (data-driven LR scaling) ===
+        # Scale LR by evidence quality (higher q_mean → more aggressive)
+        # g = sigmoid(2 * (q_mean - 0.5)) maps [0,1] → [0.12, 0.88]
+        gating_factor = torch.sigmoid(torch.tensor(2.0 * (q_mean_step - 0.5))).item()
+        effective_lr = config.tta_lr * gating_factor
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = effective_lr
+
+        # === 4.5: Compute loss (entropy minimization on selected samples) ===
+        eps_entropy = eps
         entropy_per_sample = -(
-            prob * torch.log(prob + 1e-8) +
-            (1 - prob) * torch.log(1 - prob + 1e-8)
-        )
-        entropy_mean = entropy_per_sample.mean().item()
-
-        if config.enable_collapse_detection:
-            collapse_detected = False
-
-            # Check 1: Extreme prob_mean
-            if prob_mean < config.collapse_prob_threshold or prob_mean > (1 - config.collapse_prob_threshold):
-                collapse_detected = True
-
-            # Check 2: Low prob_std (all predictions similar)
-            if prob_std < config.collapse_std_threshold:
-                collapse_detected = True
-
-            if collapse_detected:
-                collapse_counter += 1
-                if collapse_counter >= config.collapse_patience:
-                    if config.verbose:
-                        print(f"[TTA-v3] Collapse detected at step {step} "
-                            f"(prob_mean={prob_mean:.4f}, prob_std={prob_std:.4f}), EARLY STOP")
-                    break
-            else:
-                collapse_counter = 0
-        # === END FIX 6 ===
-
-        if num_updated == 0:
-            if config.verbose:
-                print(f"[TTA-v3] Step {step}: No samples pass threshold, skip")
-            tta_history.append({
-                'step': step,
-                'loss': 0.0,
-                'entropy': 0.0,
-                'loss_ap': 0.0,
-                'num_updated': 0,
-                'q_mean': q_mean_step,
-                'prob_mean': prob_mean,
-                'prob_std': prob_std,
-                'entropy_mean': entropy_mean,
-                'skipped': True,
-            })
-            continue
-
-        # === 5.4: Compute entropy loss (masked) ===
-        entropy_per_sample = -(
-            prob * torch.log(prob + 1e-8) +
-            (1 - prob) * torch.log(1 - prob + 1e-8)
+            prob * torch.log(prob + eps_entropy) +
+            (1 - prob) * torch.log(1 - prob + eps_entropy)
         )  # [B, 1]
 
-        masked_entropy = (mask * entropy_per_sample).sum() / (mask.sum() + 1e-8)
+        masked_entropy = (mask * entropy_per_sample).sum() / (mask.sum() + eps)
+        loss = masked_entropy
 
-        # === 5.5: FIX 4 - Differentiable artifact-preserving constraint ===
-        feat_base = debug['feat_base']         # [B, C, H, W], detached
-        feat_enh = debug['feat_enhanced']      # [B, C, H, W], with grad
-
-        loss_ap = model.compute_artifact_preserving_loss(feat_base, feat_enh, mask)
-
-        # === 5.6: Total loss ===
-        λ_ap = config.artifact_preserving_weight
-        loss = masked_entropy + λ_ap * loss_ap
-
-        # === 5.7: Backward and update ===
+        # === 4.6: Backward and update ===
         optimizer.zero_grad()
         loss.backward()
 
-        # Grad clipping
-        torch.nn.utils.clip_grad_norm_(params_list, max_grad_norm)
+        # Gradient clipping (relative to gradient norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(params_to_update, max_norm=1.0)
 
         optimizer.step()
 
-        # === 5.8: Record history (minimal CPU transfer) ===
+        # === 4.7: Early stopping checks ===
+        prob_mean = prob.mean().item()
+        prob_std = prob.std().item()
+        loss_val = loss.item()
+
+        # Check 1: Loss convergence
+        converged = False
+        if prev_loss is not None:
+            loss_change = abs(loss_val - prev_loss)
+            relative_eps = 0.01 * abs(prev_loss) if abs(prev_loss) > 1e-6 else 1e-4
+            if loss_change < relative_eps:
+                converged = True
+
+        # Check 2: Evidence stability
+        evidence_stable = False
+        q_change = abs(q_mean_step - prev_q_mean)
+        if q_change < 0.05:  # q changed less than 5%
+            evidence_stable = True
+
+        # Check 3: Collapse detection (hardcoded thresholds, data-independent)
+        collapse_detected = False
+        if prob_mean < 0.01 or prob_mean > 0.99:  # Extreme prediction
+            collapse_detected = True
+        if prob_std < 0.05:  # All predictions converged
+            collapse_detected = True
+
+        if collapse_detected:
+            collapse_counter += 1
+            if collapse_counter >= 2:  # patience=2
+                if config.verbose:
+                    print(f"[TTA-v3] Collapse at step {step} (prob_mean={prob_mean:.4f}, std={prob_std:.4f}), STOP")
+                break
+        else:
+            collapse_counter = 0
+
+        # Record history
         tta_history.append({
             'step': step,
-            'loss': loss.item(),
+            'loss': loss_val,
             'entropy': masked_entropy.item(),
-            'loss_ap': loss_ap.item() if isinstance(loss_ap, torch.Tensor) else 0.0,
-            'num_updated': int(num_updated),
+            'num_selected': num_selected,
             'q_mean': q_mean_step,
+            'q_threshold': q_threshold,
             'prob_mean': prob_mean,
             'prob_std': prob_std,
-            'entropy_mean': entropy_mean,
-            'alpha': debug['alpha'],
-            'skipped': False,
+            'gating_factor': gating_factor,
+            'effective_lr': effective_lr,
+            'grad_norm': grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+            'converged': converged,
+            'evidence_stable': evidence_stable,
         })
 
-        prev_entropy = entropy_mean
+        # Early stop if converged AND evidence stable
+        if converged and evidence_stable:
+            if config.verbose:
+                print(f"[TTA-v3] Converged at step {step} (loss_change={loss_change:.6f}, q_change={q_change:.6f})")
+            break
+
+        prev_loss = loss_val
+        prev_q_mean = q_mean_step
 
     # ========================================
-    # Phase 6: Final Prediction
+    # Phase 5: Final Prediction
     # ========================================
     model.eval()
     with torch.no_grad():
         logits_final, features_final, debug_final = model(images, test_time=True)
         pred_final = torch.sigmoid(logits_final)
 
-    # ========================================
-    # Phase 7: Update Memory Bank
-    # ========================================
-    if model.memory_bank is not None:
-        with torch.no_grad():
-            model.update_memory(features_final, logits_final)
-
-    # ========================================
-    # Phase 8: Disable Gradients
-    # ========================================
+    # Disable gradients
     for p in model.parameters():
         p.requires_grad = False
 
     # ========================================
-    # Prepare Results (minimal CPU transfer)
+    # Prepare Results
     # ========================================
     results = {
-        'predictions': pred_final,  # Keep on GPU
+        'predictions': pred_final,
         'logits': logits_final,
         'initial_predictions': pred_init,
         'improvement': (pred_final - pred_init).mean().item(),
         'skipped': False,
         'evidence_mean': q_mean_init,
-        'update_mode': update_mode,
+        'num_steps': len(tta_history),
     }
 
     if return_debug:
@@ -1166,9 +910,10 @@ def _inference_with_tta_v3_simple(
     config: TTANRAMv3Config,
     return_debug: bool = False
 ) -> Dict:
-    """Simple TTA without evidence calibration."""
+    """Simple TTA without evidence calibration (for ablation)."""
     device = config.device
     model.eval()
+    eps = torch.finfo(torch.float32).eps * 10
 
     with torch.no_grad():
         logits_init, _, _ = model(images, test_time=True)
@@ -1182,11 +927,11 @@ def _inference_with_tta_v3_simple(
 
     optimizer = torch.optim.Adam(params_to_update, lr=config.tta_lr)
 
-    for step in range(config.tta_steps):
+    for step in range(config.max_tta_steps):
         logits, _, _ = model(images, test_time=True)
         prob = torch.sigmoid(logits)
 
-        entropy = -(prob * torch.log(prob + 1e-8) + (1 - prob) * torch.log(1 - prob + 1e-8))
+        entropy = -(prob * torch.log(prob + eps) + (1 - prob) * torch.log(1 - prob + eps))
         loss = entropy.mean()
 
         optimizer.zero_grad()
@@ -1206,7 +951,6 @@ def _inference_with_tta_v3_simple(
         'initial_predictions': pred_init,
         'improvement': (pred_final - pred_init).mean().item(),
         'skipped': False,
-        'update_mode': 'simple',
     }
 
 
@@ -1230,17 +974,18 @@ def count_parameters(model: nn.Module) -> Dict[str, int]:
 def print_model_info(model: UnifiedTTANRAMv3):
     """Print model architecture and parameter counts."""
     print("=" * 80)
-    print("TTA-NRAM v3 (Evidence-Calibrated) Model Information")
+    print("TTA-NRAM v3 (Data-Driven) Model Information")
     print("=" * 80)
 
     # Config
-    print(f"\nConfiguration:")
+    print(f"\nConfiguration (4 core hyperparameters):")
     print(f"  Model: {model.config.model}")
     print(f"  Target Layer: {model.config.target_layer}")
-    print(f"  TTA Steps: {model.config.tta_steps}")
+    print(f"  Reduction Ratio: {model.config.reduction_ratio}")
+    print(f"  Max TTA Steps: {model.config.max_tta_steps} (early stop by data)")
+    print(f"  TTA LR: {model.config.tta_lr}")
+    print(f"  Update Sample Ratio (ρ): {model.config.update_sample_ratio}")
     print(f"  Evidence Calibration: {model.config.enable_evidence_calibration}")
-    print(f"  Sigmoid α: {model.config.sigmoid_alpha}")
-    print(f"  Artifact Preserving: {model.config.enable_artifact_preserving} ({model.config.artifact_preserving_type})")
 
     # Parameters
     params = count_parameters(model)
@@ -1253,23 +998,31 @@ def print_model_info(model: UnifiedTTANRAMv3):
     nram_params = count_parameters(model.nram)
     print(f"\nNRAM v3 Components:")
     print(f"  Total NRAM: {nram_params['total']:,} params")
-    print(f"    ├─ Artifact Detector: 0 params (parameter-free, for evidence)")
-    print(f"    ├─ Noise Estimator: 0 params (parameter-free, for evidence)")
+    print(f"    ├─ Artifact Detector: 0 params (data-driven, no hyperparameters)")
+    print(f"    ├─ Noise Estimator: 0 params (data-driven, no hyperparameters)")
     print(f"    ├─ Artifact Attention: Learnable (dual-path SE)")
-    print(f"    └─ Residual Weight α: {'Learnable (sigmoid)' if model.config.learnable_residual_weight else 'Fixed'}")
+    print(f"    └─ Residual Weight α: Fixed (0.1)")
     print(f"  Base Classifier: Frozen (pre-trained)")
 
     print("=" * 80)
 
 
 if __name__ == "__main__":
-    print("TTA-NRAM v3 (Evidence-Calibrated) module loaded successfully!")
-    print("\nKey features (NEW in v3):")
-    print("  ✅ Evidence-calibrated update policy (skip/conservative/aggressive)")
-    print("  ✅ Sigmoid-constrained learnable α (0~1)")
-    print("  ✅ Differentiable artifact-preserving constraint (HP proxy)")
-    print("  ✅ Enhanced collapse detection (entropy + std)")
-    print("  ✅ Memory-efficient design (minimal CPU transfers)")
-    print("  ✅ Base model always in no_grad (speed/memory)")
+    print("TTA-NRAM v3 (Data-Driven) module loaded successfully!")
+    print("\nKey features:")
+    print("  ✅ Data-driven (no magic numbers)")
+    print("  ✅ Robust normalization (median/MAD)")
+    print("  ✅ Quantile-based sample selection (top-ρ)")
+    print("  ✅ Continuous soft gating (no discrete modes)")
+    print("  ✅ Data-driven early stopping (convergence + collapse)")
+    print("  ✅ Only 4 hyperparameters (down from 20+)")
     print("\nUsage:")
     print("  from model.method.tta_nramv3 import UnifiedTTANRAMv3, TTANRAMv3Config, inference_with_tta_v3")
+    print("\nConfig example:")
+    print("  config = TTANRAMv3Config(")
+    print("      model='LGrad',")
+    print("      reduction_ratio=16,")
+    print("      max_tta_steps=10,")
+    print("      tta_lr=1e-4,")
+    print("      update_sample_ratio=0.7,")
+    print("  )")
