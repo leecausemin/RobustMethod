@@ -37,6 +37,9 @@ class GatingBNConfig:
     tta_lr: float = 1e-4                    # TTA learning rate
     max_tta_steps: int = 10                 # Max TTA iterations
     enable_tta: bool = True                 # Enable test-time adaptation
+    optimizer: str = "Adam"                 # "Adam", "AdamW", or "SGD"
+    momentum: float = 0.9                   # Momentum for SGD
+    weight_decay: float = 1e-4              # Weight decay for AdamW/SGD
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -228,6 +231,9 @@ class UnifiedGatingBN(nn.Module):
         # GatingBN module
         self.gating_bn = GatingBN(channels, config).to(config.device)
 
+        # Optimizer for continual TTA (initialized lazily)
+        self.optimizer = None
+
         # Cache classifier reference
         self._init_classifier_ref()
 
@@ -254,6 +260,26 @@ class UnifiedGatingBN(nn.Module):
         else:  # NPR
             self.classifier = self.base_model.model
             self.fc_layer = self.classifier.fc1
+
+    def _create_optimizer(self, params):
+        """Create optimizer based on config."""
+        if self.config.optimizer == "Adam":
+            return torch.optim.Adam(params, lr=self.config.tta_lr)
+        elif self.config.optimizer == "AdamW":
+            return torch.optim.AdamW(
+                params,
+                lr=self.config.tta_lr,
+                weight_decay=self.config.weight_decay
+            )
+        elif self.config.optimizer == "SGD":
+            return torch.optim.SGD(
+                params,
+                lr=self.config.tta_lr,
+                momentum=self.config.momentum,
+                weight_decay=self.config.weight_decay
+            )
+        else:
+            raise ValueError(f"Unknown optimizer: {self.config.optimizer}. Use 'Adam', 'AdamW', or 'SGD'.")
 
     def collect_source_stats(self, dataloader: DataLoader):
         """
@@ -376,7 +402,9 @@ class UnifiedGatingBN(nn.Module):
         for p in params_to_update:
             p.requires_grad = True
 
-        optimizer = torch.optim.Adam(params_to_update, lr=self.config.tta_lr)
+        # Create optimizer only if not exists (continual TTA)
+        if self.optimizer is None:
+            self.optimizer = self._create_optimizer(params_to_update)
 
         # TTA loop
         prev_loss = None
@@ -402,10 +430,10 @@ class UnifiedGatingBN(nn.Module):
             loss = self.config.lambda_bn * L_bn + self.config.lambda_ent * L_ent
 
             # Update
-            optimizer.zero_grad()
+            self.optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params_to_update, max_norm=1.0)
-            optimizer.step()
+            self.optimizer.step()
 
             # Early stopping: loss convergence
             loss_val = loss.item()
@@ -426,12 +454,13 @@ class UnifiedGatingBN(nn.Module):
 
     def reset(self):
         """
-        Reset gating module to initial state.
+        Reset gating module and optimizer to initial state.
 
-        Call this when switching to a new test batch to ensure
+        Call this when switching to a new domain/dataset to ensure
         fresh adaptation.
         """
         self.gating_bn.gating._init_weights()
+        self.optimizer = None  # Will be recreated on next forward
 
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         """Predict real/fake labels."""
