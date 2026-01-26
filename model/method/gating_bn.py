@@ -3,16 +3,14 @@ GatingBN (Dynamic Channel Gating + BN Anchor) for Deepfake Detection
 
 A test-time adaptation method that uses:
 1. Dynamic 1x1 Conv gating (spatial-aware channel reweighting)
-2. BN Anchor (source statistics alignment)
-3. Loss: L_bn (main) + L_ent (auxiliary)
+2. BN Anchor (backbone's BN statistics for normalization)
+3. Loss: L_ent (entropy) + L_l1 (regularization)
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as Fn
 from dataclasses import dataclass
-from typing import Tuple, Optional
-from torch.utils.data import DataLoader
+from typing import Tuple
 
 
 # ============================================================================
@@ -30,9 +28,9 @@ class GatingBNConfig:
     init_bias: float = 2.0                  # Initial bias (sigmoid(2)≈0.88)
 
     # Loss weights
-    lambda_bn: float = 1.0                  # BN alignment loss weight (main)
-    lambda_ent: float = 0.1                 # Entropy loss weight (auxiliary)
+    lambda_ent: float = 0.1                 # Entropy loss weight
     lambda_l1: float = 0.01                 # L1 regularization weight (gate → 1)
+
 
     # TTA parameters
     tta_lr: float = 1e-4                    # TTA learning rate
@@ -98,8 +96,8 @@ class GatingBN(nn.Module):
     Flow:
         F → DynamicGating → F_gated → BN_anchor → F_anchored
 
-    The BN anchor normalizes using source statistics to maintain
-    the source manifold, preventing distribution drift from gating.
+    The BN anchor normalizes using backbone's BN statistics (running_mean, running_var).
+    These statistics are copied from the last BN layer of the target layer.
     """
 
     def __init__(self, channels: int, config: GatingBNConfig):
@@ -114,16 +112,17 @@ class GatingBN(nn.Module):
             init_bias=config.init_bias
         )
 
-        # Source statistics (to be set via set_source_stats)
-        self.register_buffer('mu_src', torch.zeros(channels))
-        self.register_buffer('std_src', torch.ones(channels))
-        self.stats_initialized = False
+        # BN layer copied from backbone (to be set via set_bn_from_backbone)
+        self.bn_anchor = nn.BatchNorm2d(channels, affine=False)
+        self.bn_initialized = False
 
-    def set_source_stats(self, mu: torch.Tensor, std: torch.Tensor):
-        """Set source statistics for BN anchor."""
-        self.mu_src.copy_(mu)
-        self.std_src.copy_(std)
-        self.stats_initialized = True
+    def set_bn_from_backbone(self, bn_layer: nn.BatchNorm2d):
+        """Copy running statistics from backbone's BN layer."""
+        with torch.no_grad():
+            self.bn_anchor.running_mean.copy_(bn_layer.running_mean)
+            self.bn_anchor.running_var.copy_(bn_layer.running_var)
+        self.bn_anchor.eval()  # Always use running stats, not batch stats
+        self.bn_initialized = True
 
     def forward(self, F: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -137,12 +136,8 @@ class GatingBN(nn.Module):
         # Dynamic gating
         F_gated, gate = self.gating(F)
 
-        # BN Anchor: normalize with source statistics
-        # F_anchored = (F_gated - mu_src) / std_src
-        eps = 1e-5
-        mu = self.mu_src.view(1, -1, 1, 1)
-        std = self.std_src.view(1, -1, 1, 1)
-        F_anchored = (F_gated - mu) / (std + eps)
+        # BN Anchor: normalize with backbone's BN statistics
+        F_anchored = self.bn_anchor(F_gated)
 
         return F_anchored, F_gated, gate
 
@@ -187,8 +182,8 @@ class UnifiedGatingBN(nn.Module):
 
     Key features:
     1. Dynamic 1x1 Conv gating - spatially-aware channel reweighting
-    2. BN Anchor - maintains source manifold via statistics alignment
-    3. TTA Loss - L_bn (main) + L_ent (auxiliary)
+    2. BN Anchor - uses backbone's BN statistics for normalization
+    3. TTA Loss - L_ent (entropy) + L_l1 (regularization)
 
     Args:
         base_model: Pre-trained LGrad or NPR model
@@ -201,9 +196,6 @@ class UnifiedGatingBN(nn.Module):
         >>> lgrad = LGrad(stylegan_weights="...", classifier_weights="...", device="cuda")
         >>> config = GatingBNConfig(model="LGrad", tta_lr=1e-4, max_tta_steps=10)
         >>> model = UnifiedGatingBN(lgrad, config)
-        >>>
-        >>> # Collect source statistics first
-        >>> model.collect_source_stats(clean_dataloader)
         >>>
         >>> # Inference with TTA
         >>> logits = model(images)
@@ -232,6 +224,9 @@ class UnifiedGatingBN(nn.Module):
         # GatingBN module
         self.gating_bn = GatingBN(channels, config).to(config.device)
 
+        # Copy BN statistics from backbone
+        self._init_bn_from_backbone()
+
         # Optimizer for continual TTA (initialized lazily)
         self.optimizer = None
 
@@ -245,6 +240,33 @@ class UnifiedGatingBN(nn.Module):
             return 'model.layer2'
         else:
             raise ValueError(f"Unknown model: {self.config.model}")
+
+    def _init_bn_from_backbone(self):
+        """Find and copy BN layer from the last block of target layer."""
+        target_layer = self.config.target_layer
+
+        # Get the target layer module
+        if self.config.model == "LGrad":
+            # classifier.layer4 -> last block's bn3 (Bottleneck) or bn2 (BasicBlock)
+            layer = self.base_model.classifier.layer4
+        else:  # NPR
+            # model.layer2 -> last block's bn3 (Bottleneck) or bn2 (BasicBlock)
+            layer = self.base_model.model.layer2
+
+        # Get the last block
+        last_block = layer[-1]
+
+        # Find the last BN in the block (bn3 for Bottleneck, bn2 for BasicBlock)
+        if hasattr(last_block, 'bn3'):
+            bn_layer = last_block.bn3
+        elif hasattr(last_block, 'bn2'):
+            bn_layer = last_block.bn2
+        else:
+            raise RuntimeError(f"Cannot find BN layer in {last_block}")
+
+        # Copy to GatingBN
+        self.gating_bn.set_bn_from_backbone(bn_layer)
+        print(f"BN Anchor initialized from {target_layer}[-1].bn{'3' if hasattr(last_block, 'bn3') else '2'}")
 
     def _get_layer_channels(self, layer_name: str) -> int:
         dummy_input = torch.zeros(1, 3, 224, 224).to(self.config.device)
@@ -282,60 +304,6 @@ class UnifiedGatingBN(nn.Module):
         else:
             raise ValueError(f"Unknown optimizer: {self.config.optimizer}. Use 'Adam', 'AdamW', or 'SGD'.")
 
-    def collect_source_stats(self, dataloader: DataLoader):
-        """
-        Collect source statistics from clean data.
-
-        Args:
-            dataloader: DataLoader for clean source data
-        """
-        all_features = []
-
-        self.base_model.eval()
-        with torch.no_grad():
-            for batch in dataloader:
-                if isinstance(batch, (list, tuple)):
-                    images = batch[0]
-                else:
-                    images = batch
-
-                images = images.to(self.config.device)
-                _ = self.base_model(images)
-                feat = self.feature_extractor.features[self.config.target_layer]
-                all_features.append(feat)
-
-        all_features = torch.cat(all_features, dim=0)
-
-        # Compute channel-wise statistics
-        mu_src = all_features.mean(dim=(0, 2, 3))  # [C]
-        std_src = all_features.std(dim=(0, 2, 3), unbiased=False)  # [C]
-
-        # Set to GatingBN module
-        self.gating_bn.set_source_stats(mu_src, std_src)
-
-        print(f"Source statistics collected from {len(all_features)} samples")
-        print(f"  mu_src: mean={mu_src.mean().item():.4f}, std={mu_src.std().item():.4f}")
-        print(f"  std_src: mean={std_src.mean().item():.4f}, std={std_src.std().item():.4f}")
-
-    def set_source_stats(self, mu_src: torch.Tensor, std_src: torch.Tensor):
-        """Manually set source statistics."""
-        self.gating_bn.set_source_stats(mu_src.to(self.config.device),
-                                         std_src.to(self.config.device))
-
-    def _compute_bn_loss(self, F_gated: torch.Tensor) -> torch.Tensor:
-        """
-        Compute BN alignment loss.
-
-        L_bn = |μ(F_gated) - μ_src| + |σ(F_gated) - σ_src|
-        """
-        mu_batch = F_gated.mean(dim=(0, 2, 3))  # [C]
-        std_batch = F_gated.std(dim=(0, 2, 3), unbiased=False)  # [C]
-
-        loss_mu = (mu_batch - self.gating_bn.mu_src).abs().mean()
-        loss_std = (std_batch - self.gating_bn.std_src).abs().mean()
-
-        return loss_mu + loss_std
-
     def _compute_entropy_loss(self, logits: torch.Tensor) -> torch.Tensor:
         """
         Compute entropy minimization loss.
@@ -371,10 +339,6 @@ class UnifiedGatingBN(nn.Module):
         """
         if enable_tta is None:
             enable_tta = self.config.enable_tta
-
-        if not self.gating_bn.stats_initialized:
-            raise RuntimeError("Source statistics not initialized. "
-                             "Call collect_source_stats() or set_source_stats() first.")
 
         if enable_tta:
             return self._forward_with_tta(images)
@@ -437,11 +401,9 @@ class UnifiedGatingBN(nn.Module):
             logits = self.fc_layer(feat_pooled)
 
             # Compute losses
-            L_bn = self._compute_bn_loss(F_gated)
             L_ent = self._compute_entropy_loss(logits)
             L_l1 = self._compute_l1_loss(gate)
-            loss = (self.config.lambda_bn * L_bn +
-                    self.config.lambda_ent * L_ent +
+            loss = (self.config.lambda_ent * L_ent +
                     self.config.lambda_l1 * L_l1)
 
             # Update
