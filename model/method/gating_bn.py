@@ -32,6 +32,7 @@ class GatingBNConfig:
     # Loss weights
     lambda_bn: float = 1.0                  # BN alignment loss weight (main)
     lambda_ent: float = 0.1                 # Entropy loss weight (auxiliary)
+    lambda_l1: float = 0.01                 # L1 regularization weight (gate → 1)
 
     # TTA parameters
     tta_lr: float = 1e-4                    # TTA learning rate
@@ -346,6 +347,17 @@ class UnifiedGatingBN(nn.Module):
         entropy = -(prob * (prob + eps).log() + (1 - prob) * (1 - prob + eps).log())
         return entropy.mean()
 
+    def _compute_l1_loss(self, gate: torch.Tensor) -> torch.Tensor:
+        """
+        Compute L1 regularization loss on gate deviation from 1.
+
+        L_l1 = mean(|1 - gate|)
+
+        This encourages gate values to stay close to 1 (preserve original features),
+        preventing entropy minimization from making gates too extreme.
+        """
+        return (1 - gate).abs().mean()
+
     def forward(self, images: torch.Tensor, enable_tta: bool = None) -> torch.Tensor:
         """
         Forward pass with optional TTA.
@@ -427,7 +439,10 @@ class UnifiedGatingBN(nn.Module):
             # Compute losses
             L_bn = self._compute_bn_loss(F_gated)
             L_ent = self._compute_entropy_loss(logits)
-            loss = self.config.lambda_bn * L_bn + self.config.lambda_ent * L_ent
+            L_l1 = self._compute_l1_loss(gate)
+            loss = (self.config.lambda_bn * L_bn +
+                    self.config.lambda_ent * L_ent +
+                    self.config.lambda_l1 * L_l1)
 
             # Update
             self.optimizer.zero_grad()
