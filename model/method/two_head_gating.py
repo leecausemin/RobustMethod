@@ -43,6 +43,9 @@ class TwoHeadGatingConfig:
     lambda_over: float = 0.1                # Overlap penalty
     rho: float = 0.1                        # Nuisance budget (allowed suppression)
 
+    # Anti-collapse: confidence threshold
+    confidence_threshold: float = 0.9       # Skip samples with prob > threshold or < (1-threshold)
+
     # Optimizer (separate lr for each head)
     lr_a: float = 1e-5                      # Artifact head (slow)
     lr_n: float = 1e-4                      # Nuisance head (fast)
@@ -92,13 +95,18 @@ class TwoHeadChannelGating(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights for stable starting point."""
-        # Artifact head: preserve (g_a ≈ 0.88)
+        """Initialize weights for input-dependent gating."""
+        # Artifact head: small identity-like init + high bias (preserve)
+        # Each channel looks at itself with small weight
         nn.init.zeros_(self.conv_a.weight)
+        with torch.no_grad():
+            # Diagonal init: channel i attends to channel i
+            for i in range(self.channels):
+                self.conv_a.weight[i, i, 0, 0] = 0.01
         nn.init.constant_(self.conv_a.bias, self.config.init_bias_a)
 
-        # Nuisance head: neutral start (g_n ≈ 0.88)
-        nn.init.zeros_(self.conv_n.weight)
+        # Nuisance head: small random init + high bias (neutral start)
+        nn.init.normal_(self.conv_n.weight, mean=0, std=0.01)
         nn.init.constant_(self.conv_n.bias, self.config.init_bias_n)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -376,14 +384,24 @@ class UnifiedTwoHeadGating(nn.Module):
 
     def _compute_entropy_loss(self, logits: torch.Tensor) -> torch.Tensor:
         """
-        L_ent: Entropy minimization loss.
+        L_ent: Entropy minimization loss with confidence threshold.
 
-        Encourages confident predictions (low entropy).
+        Excludes samples that are already too confident (prob > threshold or < 1-threshold).
+        This prevents confirmation bias and model collapse.
         """
         eps = 1e-8
         prob = torch.sigmoid(logits)
         entropy = -(prob * (prob + eps).log() + (1 - prob) * (1 - prob + eps).log())
-        return entropy.mean()
+
+        # Confidence threshold: exclude already-confident samples
+        threshold = self.config.confidence_threshold
+        uncertain_mask = (prob > (1 - threshold)) & (prob < threshold)  # e.g., 0.1 < prob < 0.9
+
+        if uncertain_mask.sum() > 0:
+            return entropy[uncertain_mask].mean()
+        else:
+            # All samples are confident, return zero loss (no update)
+            return torch.zeros(1, device=logits.device, requires_grad=True).squeeze()
 
     def _compute_artifact_loss(self, g_a: torch.Tensor) -> torch.Tensor:
         """
@@ -475,6 +493,7 @@ class UnifiedTwoHeadGating(nn.Module):
 
         # TTA loop
         prev_loss = None
+        threshold = self.config.confidence_threshold
 
         for step in range(self.config.max_tta_steps):
             # Forward through base model (frozen)
@@ -491,7 +510,17 @@ class UnifiedTwoHeadGating(nn.Module):
             feat_pooled = torch.flatten(feat_pooled, 1)
             logits = self.fc_layer(feat_pooled)
 
-            # === Compute losses ===
+            # Check if any samples are uncertain (worth adapting)
+            with torch.no_grad():
+                prob = torch.sigmoid(logits)
+                uncertain_mask = (prob > (1 - threshold)) & (prob < threshold)
+                n_uncertain = uncertain_mask.sum().item()
+
+            # Skip TTA if all samples are already confident
+            if n_uncertain == 0:
+                break
+
+            # === Compute losses (only for uncertain samples) ===
             L_ent = self._compute_entropy_loss(logits)
             L_a = self._compute_artifact_loss(g_a)
             L_n = self._compute_nuisance_loss(g_n)
