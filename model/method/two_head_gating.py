@@ -34,14 +34,19 @@ class TwoHeadGatingConfig:
     tau_n: float = 1.0                      # Nuisance head temperature
     init_bias_a: float = 2.0                # g_a ≈ 0.88 (preserve)
     init_bias_n: float = 2.0                # g_n ≈ 0.88 (neutral start)
-    gamma: float = 0.25                     # Nuisance control strength
+    gamma: float = 0.5                      # Nuisance control strength (initial value)
+    gamma_per_channel: bool = False         # If True, gamma is per-channel [C], else scalar
+    lr_gamma: float = 1e-4                  # Learning rate for gamma parameter
 
     # Loss weights
     lambda_ent: float = 0.1                 # Entropy minimization
     lambda_a: float = 0.1                   # Artifact preservation
     lambda_n: float = 0.05                  # Nuisance budget constraint
     lambda_over: float = 0.1                # Overlap penalty
-    rho: float = 0.1                        # Nuisance budget (allowed suppression)
+    rho: float = 0.1                        # Nuisance budget (allowed suppression, initial value)
+    rho_min: float = 0.05                   # Minimum rho (prevent unlimited suppression)
+    rho_max: float = 0.3                    # Maximum rho
+    lr_rho: float = 1e-4                    # Learning rate for rho parameter
 
     # Anti-collapse: confidence threshold
     confidence_threshold: float = 0.9       # Skip samples with prob > threshold or < (1-threshold)
@@ -54,7 +59,7 @@ class TwoHeadGatingConfig:
     weight_decay: float = 1e-4              # Weight decay for AdamW/SGD
 
     # TTA parameters
-    max_tta_steps: int = 5                  # Reduced from 10 to prevent collapse
+    max_tta_steps: int = 10                 # Reduced from 10 to prevent collapse
     enable_tta: bool = True
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -91,6 +96,13 @@ class TwoHeadChannelGating(nn.Module):
         # Two heads: 1x1 conv for channel-wise scoring
         self.conv_a = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
         self.conv_n = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+
+        # Learnable gamma (nuisance control strength)
+        # Can be per-channel or scalar based on config
+        if getattr(config, 'gamma_per_channel', False):
+            self.gamma = nn.Parameter(torch.full((channels,), config.gamma))
+        else:
+            self.gamma = nn.Parameter(torch.tensor(config.gamma))
 
         self._init_weights()
 
@@ -135,7 +147,11 @@ class TwoHeadChannelGating(nn.Module):
         # Residual-style composition: g = clip(g_a + γ(g_n - 1), 0, 1)
         # - g_a is base pass-through
         # - γ(g_n - 1) is adjustment (negative when g_n < 1)
-        g = torch.clamp(g_a + self.config.gamma * (g_n - 1), 0, 1)
+        # gamma is now a learnable parameter (scalar or per-channel)
+        gamma = self.gamma
+        if gamma.dim() == 1:
+            gamma = gamma.view(1, -1, 1, 1)  # [1, C, 1, 1] for per-channel
+        g = torch.clamp(g_a + gamma * (g_n - 1), 0, 1)
 
         # Apply gate (broadcast [B,C,1,1] to [B,C,H,W])
         x_gated = x * g
@@ -291,6 +307,9 @@ class UnifiedTwoHeadGating(nn.Module):
         # Two-Head Gating + BN module (use detected device)
         self.gating_bn = TwoHeadGatingBN(channels, config).to(self.device)
 
+        # Learnable rho (nuisance budget)
+        self.rho = nn.Parameter(torch.tensor(config.rho, device=self.device))
+
         # Copy BN statistics from backbone
         self._init_bn_from_backbone()
 
@@ -360,6 +379,16 @@ class UnifiedTwoHeadGating(nn.Module):
                 'lr': self.config.lr_n,
                 'name': 'nuisance_head'
             },
+            {
+                'params': [self.gating_bn.gating.gamma],
+                'lr': getattr(self.config, 'lr_gamma', self.config.lr_n),
+                'name': 'gamma'
+            },
+            {
+                'params': [self.rho],
+                'lr': self.config.lr_rho,
+                'name': 'rho'
+            },
         ]
 
         if self.config.optimizer == "Adam":
@@ -418,9 +447,12 @@ class UnifiedTwoHeadGating(nn.Module):
 
         Budget constraint: nuisance head can suppress up to ρ on average.
         Beyond that, penalty increases quadratically.
+        rho is a learnable parameter, clamped to [rho_min, rho_max].
         """
         suppression = (1 - g_n).mean()
-        return F.relu(suppression - self.config.rho) ** 2
+        # Clamp rho to prevent unlimited suppression (collapse risk)
+        rho_clamped = torch.clamp(self.rho, self.config.rho_min, self.config.rho_max)
+        return F.relu(suppression - rho_clamped) ** 2
 
     def _compute_overlap_loss(self, g_a: torch.Tensor, g_n: torch.Tensor) -> torch.Tensor:
         """
@@ -561,6 +593,14 @@ class UnifiedTwoHeadGating(nn.Module):
         Call this when switching to a new domain/dataset.
         """
         self.gating_bn.gating._init_weights()
+        # Reset gamma to initial value
+        with torch.no_grad():
+            if self.config.gamma_per_channel:
+                self.gating_bn.gating.gamma.fill_(self.config.gamma)
+            else:
+                self.gating_bn.gating.gamma.fill_(self.config.gamma)
+            # Reset rho to initial value
+            self.rho.fill_(self.config.rho)
         self.optimizer = None
 
     def predict(self, x: torch.Tensor) -> torch.Tensor:
@@ -585,6 +625,8 @@ class UnifiedTwoHeadGating(nn.Module):
             features = self.feature_extractor.features[self.config.target_layer]
             _, _, g, g_a, g_n = self.gating_bn(features)
 
+        gamma = self.gating_bn.gating.gamma
+        rho_clamped = torch.clamp(self.rho, self.config.rho_min, self.config.rho_max)
         return {
             'g_mean': g.mean().item(),
             'g_std': g.std().item(),
@@ -593,4 +635,7 @@ class UnifiedTwoHeadGating(nn.Module):
             'g_n_mean': g_n.mean().item(),
             'g_n_std': g_n.std().item(),
             'overlap': ((1 - g_a) * (1 - g_n)).mean().item(),
+            'rho': rho_clamped.item(),
+            'gamma_mean': gamma.mean().item(),
+            'gamma_std': gamma.std().item() if gamma.numel() > 1 else 0.0,
         }
